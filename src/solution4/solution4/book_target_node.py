@@ -61,6 +61,20 @@ class BookTargetNode(Node):
         self.declare_parameter('row_index_base', 1)
         self.row_index_base = int(self.get_parameter('row_index_base').value)
 
+        # Digit-detection gating. The classifier labels every candidate region
+        # it is handed, so a confidence floor plus agreement across consecutive
+        # frames is what separates a real overhead marker from a passing blob.
+        self.declare_parameter('digit_confidence', 0.90)
+        self.declare_parameter('digit_confirm_frames', 3)
+        # Fraction of the frame height, measured from the top, that the digit
+        # search is allowed to look at.
+        self.declare_parameter('digit_search_band', 0.5)
+        self.digit_confidence = float(self.get_parameter('digit_confidence').value)
+        self.digit_confirm_frames = int(self.get_parameter('digit_confirm_frames').value)
+        self.digit_search_band = float(self.get_parameter('digit_search_band').value)
+        self._digit_streak = 0
+        self._last_digit_confidence = 0.0
+
         # 2. ONNX Model Initialization
         try:
             package_share = get_package_share_directory('solution4')
@@ -100,11 +114,15 @@ class BookTargetNode(Node):
         self.shelf_approach_pose_sent = False
 
         # Annotated images must land in erc_images/ inside the team repository
-        # (Phase 1 spec, "Saving Images"). Override with ERC_IMAGES_DIR if the
-        # node is launched from somewhere other than the workspace root.
-        self.images_dir = os.environ.get(
-            'ERC_IMAGES_DIR', os.path.join(os.getcwd(), 'erc_images')
-        )
+        # (Phase 1 spec, "Saving Images").
+        #
+        # Only src/ is bind-mounted into the container, so anything written to
+        # the container's working directory is lost when the container is
+        # recreated. Resolving from __file__ instead puts the images on the
+        # mounted tree, where they persist and can be committed. Requires
+        # --symlink-install, which the README mandates anyway; falls back to
+        # the working directory if that ever stops holding.
+        self.images_dir = os.environ.get('ERC_IMAGES_DIR') or self._default_images_dir()
         try:
             os.makedirs(self.images_dir, exist_ok=True)
         except OSError as e:
@@ -241,16 +259,26 @@ class BookTargetNode(Node):
                 self.table_position = 'front'
                 self.rotation_direction = -1
             else:
-                # LiDAR Fallback
-                self.table_position = self._determine_table_via_lidar()
+                # LiDAR Fallback. The scan history is empty for the first few
+                # frames after start-up; latching the 'none' it returns then
+                # would leave rotation_direction at 0, so the base never turns
+                # and the trial deadlocks. Stay 'unknown' and retry instead.
+                detected = self._determine_table_via_lidar()
+                if detected not in ('left', 'right', 'front'):
+                    self.get_logger().info(
+                        '[STEP 3] Table position not resolved yet - retrying '
+                        'on the next frame.',
+                        throttle_duration_sec=2.0,
+                    )
+                    return
+
+                self.table_position = detected
                 if self.table_position == 'left':
                     self.rotation_direction = -1
                 elif self.table_position == 'right':
                     self.rotation_direction = 1
                 elif self.table_position == 'front':
                     self.rotation_direction = -1
-
-                    return
 
             self.table_detection_started = None
             self.get_logger().info(f"[STEP 2/3] Table located at '{self.table_position}'.")
@@ -273,7 +301,14 @@ class BookTargetNode(Node):
         # ---------------------------------------------------------------------
         # STEP 4: MONITOR DEPTH JUMPS
         # ---------------------------------------------------------------------
-        depth_jump = self._check_depth_patch_change(depth_msg)
+        # Once the target column is in hand the search is over; the "rotated
+        # past the shelf" terminator below must not fire and end the trial
+        # while we are standing still reading the books.
+        depth_jump = (
+            self._check_depth_patch_change(depth_msg)
+            if self.target_column_box is None
+            else False
+        )
 
         if depth_jump and self.depth_change_count < 2:
             self.depth_change_count += 1
@@ -309,8 +344,30 @@ class BookTargetNode(Node):
         # ---------------------------------------------------------------------
         if self.digit_recog_active and self.target_column_box is None:
             col_box = self._scan_for_column_digit(frame)
+            if col_box is None:
+                self._digit_streak = 0
+            else:
+                self._digit_streak += 1
+
+            if col_box is not None and self._digit_streak < self.digit_confirm_frames:
+                self.get_logger().info(
+                    f"[STEP 5] Candidate digit '{self.shelf_column_number}' "
+                    f"(confidence {self._last_digit_confidence:.2f}), "
+                    f"{self._digit_streak}/{self.digit_confirm_frames} frames - "
+                    "keep looking.",
+                    throttle_duration_sec=1.0,
+                )
+                col_box = None
+
             if col_box is not None:
                 self.target_column_box = col_box
+                # Stop the base the moment the column is identified. The box is
+                # captured once from this frame; if the base keeps rotating,
+                # every later frame has the column somewhere else and the book
+                # search below ends up examining a stale region of a moving
+                # image - which is why the run used to spin past the shelf
+                # without ever finding the book.
+                self._stop_robot()
                 self._publish_column_identification()
                 self._save_column_image(frame, col_box)
                 self.get_logger().info(f"[STEP 5] Digit '{self.shelf_column_number}' recognized.")
@@ -347,6 +404,28 @@ class BookTargetNode(Node):
                 self._save_final_annotated_image(frame, self.target_column_box, target_box, row)
                 self.processing_complete = True
                 self.get_logger().info("[STEP 7] Target book identified and pose data published. Task Complete.")
+
+    @staticmethod
+    def _default_images_dir():
+        """Locate erc_images/ on the bind-mounted source tree.
+
+        This file lives at <src>/solution4/solution4/book_target_node.py, so
+        three levels up is the mounted repository content.
+        """
+        try:
+            # colcon --symlink-install executes this module from build/, so
+            # __file__ must be resolved through the symlink to reach the real
+            # source path before walking up to the workspace's src/.
+            path = os.path.dirname(os.path.realpath(__file__))
+            while True:
+                path, tail = os.path.split(path)
+                if not tail:
+                    break
+                if tail == 'src':
+                    return os.path.join(path, 'src', 'erc_images')
+        except (OSError, NameError):
+            pass
+        return os.path.join(os.getcwd(), 'erc_images')
 
     # =========================================================================
     # COMPETITION SCORING PUBLISHERS
@@ -486,23 +565,38 @@ class BookTargetNode(Node):
         gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
         enhanced = self.clahe.apply(gray)
 
+        # The markers sit on plates at z = 2.26 m, above the 2.10 m shelf, so
+        # they only ever appear in the upper part of the frame. The robot's own
+        # grippers sit mid-frame and the classifier labels them as digits with
+        # high confidence, so restricting the search band is what actually
+        # rejects them - a confidence floor alone does not.
+        search_height = max(1, int(enhanced.shape[0] * self.digit_search_band))
+        band = enhanced[0:search_height, :]
+
         mser = cv2.MSER_create(min_area=60, max_area=14000)
         try:
-            regions, _ = mser.detectRegions(enhanced)
+            regions, _ = mser.detectRegions(band)
         except cv2.error:
             return None
 
         for pts in regions:
             x, y, w, h = cv2.boundingRect(pts.reshape(-1, 1, 2))
             if 10 < h < 150 and 0.2 < (w / float(h)) < 1.4:
-                roi_gray = enhanced[y:y + h, x:x + w]
+                roi_gray = band[y:y + h, x:x + w]
                 deskew_roi = self._deskew_roi(roi_gray, pts)
                 digit = self._predict_digit(deskew_roi)
                 if digit == self.shelf_column_number:
+                    # Band starts at row 0, so frame and band coordinates agree.
                     return (x, y, w, h)
         return None
 
     def _predict_digit(self, roi):
+        """Classify a candidate region, rejecting anything unconvincing.
+
+        The network assigns every region some class, so without a confidence
+        floor an arbitrary grey blob - the robot's own gripper, for instance -
+        scores as a digit and the run commits to a column that is not there.
+        """
         _, thresh = cv2.threshold(roi, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
         h, w = thresh.shape[:2]
         scale = 20.0 / max(h, w)
@@ -511,9 +605,20 @@ class BookTargetNode(Node):
         canvas[(28 - nh) // 2: (28 - nh) // 2 + nh, (28 - nw) // 2: (28 - nw) // 2 + nw] = cv2.resize(thresh, (nw, nh))
         blob = cv2.dnn.blobFromImage(canvas, 1.0 / 255.0, (28, 28))
         self.net.setInput(blob)
-        probs = self.net.forward()[0]
+
+        logits = self.net.forward()[0].astype(np.float64)
+        shifted = logits - np.max(logits)
+        exp = np.exp(shifted)
+        probs = exp / np.sum(exp)
+
         pred = int(np.argmax(probs))
-        return str(pred) if 1 <= pred <= 5 else None
+        confidence = float(probs[pred])
+        if not 1 <= pred <= 5:
+            return None
+        if confidence < self.digit_confidence:
+            return None
+        self._last_digit_confidence = confidence
+        return str(pred)
 
     def _scan_column_books(self, frame, col_box):
         """Locate every coloured book sitting under the target column marker.
