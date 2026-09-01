@@ -1,4 +1,5 @@
 from collections import deque
+import datetime
 import math
 import os
 
@@ -21,6 +22,7 @@ from rclpy.qos import (
 
 from geometry_msgs.msg import PointStamped, PoseStamped, Twist
 from sensor_msgs.msg import Image, LaserScan, Imu
+from std_msgs.msg import Int32
 from trajectory_msgs.msg import JointTrajectory, JointTrajectoryPoint
 from builtin_interfaces.msg import Time
 from ament_index_python.packages import get_package_share_directory
@@ -50,6 +52,14 @@ class BookTargetNode(Node):
 
         self.shelf_column_number = str(raw_shelf)
         self.book_colour = str(raw_colour).strip().lower()
+
+        # Row numbering base. The Phase 1 PDF asks for "the shelf row (1-4)",
+        # while the simulator names those same four rows 2..5 internally
+        # (ACTIVE_ROWS = [1,2,3,4] rendered as row_{i+1}). We publish 1 for the
+        # topmost active row; set this parameter to 2 if the organisers confirm
+        # the other convention.
+        self.declare_parameter('row_index_base', 1)
+        self.row_index_base = int(self.get_parameter('row_index_base').value)
 
         # 2. ONNX Model Initialization
         try:
@@ -81,9 +91,24 @@ class BookTargetNode(Node):
         self.image1_path = None
         self.image2_path = None
 
+        # Scoring-topic latch state (publish once per trial)
+        self.column_id_published = False
+        self.row_id_published = False
+
         self.ROTATE_SPEED = 0.4
         self.SHELF_APPROACH_STANDOFF_M = 0.6
         self.shelf_approach_pose_sent = False
+
+        # Annotated images must land in erc_images/ inside the team repository
+        # (Phase 1 spec, "Saving Images"). Override with ERC_IMAGES_DIR if the
+        # node is launched from somewhere other than the workspace root.
+        self.images_dir = os.environ.get(
+            'ERC_IMAGES_DIR', os.path.join(os.getcwd(), 'erc_images')
+        )
+        try:
+            os.makedirs(self.images_dir, exist_ok=True)
+        except OSError as e:
+            self.get_logger().error(f"[INIT] Cannot create {self.images_dir}: {e}")
 
         # OpenCV Resources
         self.bridge = CvBridge()
@@ -104,6 +129,16 @@ class BookTargetNode(Node):
         self.arm_right_pub = self.create_publisher(JointTrajectory, '/arm_right_controller/joint_trajectory', 10)
         self.cmd_vel_pub = self.create_publisher(Twist, '/cmd_vel', 10)
         self.shelf_approach_pub = self.create_publisher(PoseStamped, '/erc/shelf_approach_pose', latched_qos)
+
+        # Competition scoring topics (Phase 1 rubric, Table 1: +1 point each).
+        # Latched so a monitor that subscribes after we publish still receives
+        # the value.
+        self.column_id_pub = self.create_publisher(
+            Int32, '/erc/shelf_column_identification', latched_qos
+        )
+        self.row_id_pub = self.create_publisher(
+            Int32, '/erc/shelf_row_identification', latched_qos
+        )
 
         # Synchronized Camera Subscribers
         camera_qos = QoSProfile(
@@ -180,15 +215,14 @@ class BookTargetNode(Node):
 
         # Register the 2-argument message filter callback HERE
         self.arms_ready = True
-        
+
     def rgbd_callback(self, colour_msg, depth_msg):
         if not self.arms_ready:
             return
 
         self.vision_timer.cancel()
         self.arms_ready = True
-        
-        
+
         if self.processing_complete or not self.arms_ready:
             return
 
@@ -237,7 +271,7 @@ class BookTargetNode(Node):
             return
 
         # ---------------------------------------------------------------------
-        # STEP 4: MONITOR DEPTH JUMPS 
+        # STEP 4: MONITOR DEPTH JUMPS
         # ---------------------------------------------------------------------
         depth_jump = self._check_depth_patch_change(depth_msg)
 
@@ -277,17 +311,28 @@ class BookTargetNode(Node):
             col_box = self._scan_for_column_digit(frame)
             if col_box is not None:
                 self.target_column_box = col_box
+                self._publish_column_identification()
                 self._save_column_image(frame, col_box)
                 self.get_logger().info(f"[STEP 5] Digit '{self.shelf_column_number}' recognized.")
 
         # Once digit is recognized, proceed to book recognition
         if self.target_column_box is not None:
-            book_center = self._scan_for_target_book(frame, self.target_column_box)
-            if book_center is not None:
+            books = self._scan_column_books(frame, self.target_column_box)
+            target_box = books.get(self.book_colour)
+            if target_box is not None:
+                bx, by, bw, bh = target_box
+                book_center = (bx + bw // 2, by + bh // 2)
+
                 # -------------------------------------------------------------
                 # STEP 7: PUBLISH DATA & COMPLETE
                 # -------------------------------------------------------------
                 self._stop_robot()
+
+                # Row identification is derived from where this book sits among
+                # the other coloured books in the same column.
+                row = self._row_for_colour(books, self.book_colour)
+                if row is not None:
+                    self._publish_row_identification(row)
 
                 # Publish Book Pixel Target
                 pt = PointStamped()
@@ -299,9 +344,39 @@ class BookTargetNode(Node):
                 self._publish_shelf_approach_pose()
 
                 # Terminal Log Image Paths
-                self._save_final_annotated_image(frame, self.target_column_box, book_center)
+                self._save_final_annotated_image(frame, self.target_column_box, target_box, row)
                 self.processing_complete = True
                 self.get_logger().info("[STEP 7] Target book identified and pose data published. Task Complete.")
+
+    # =========================================================================
+    # COMPETITION SCORING PUBLISHERS
+    # =========================================================================
+    def _publish_column_identification(self):
+        """Publish the identified shelf column (+1 point, rubric Table 1)."""
+        if self.column_id_published:
+            return
+        try:
+            value = int(self.shelf_column_number)
+        except (TypeError, ValueError):
+            self.get_logger().error(
+                f"[SCORE] Cannot publish column id: '{self.shelf_column_number}' is not an int."
+            )
+            return
+        self.column_id_pub.publish(Int32(data=value))
+        self.column_id_published = True
+        self.get_logger().info(
+            f"[SCORE] Published {value} to /erc/shelf_column_identification"
+        )
+
+    def _publish_row_identification(self, row):
+        """Publish the identified shelf row (+1 point, rubric Table 1)."""
+        if self.row_id_published:
+            return
+        self.row_id_pub.publish(Int32(data=int(row)))
+        self.row_id_published = True
+        self.get_logger().info(
+            f"[SCORE] Published {row} to /erc/shelf_row_identification"
+        )
 
     # =========================================================================
     # HELPER PROCESSING METHODS
@@ -343,10 +418,10 @@ class BookTargetNode(Node):
 
         front_left = self._average_sector_min(130.0, 5.0, self.front_scan_history)
         front_right = self._average_sector_min(-5.0, -130.0, self.front_scan_history)
-       
+
         rear_left = self._average_sector_min(5.0, 130.0, self.rear_scan_history)
         rear_right = self._average_sector_min(-130.0, -5.0, self.rear_scan_history)
-     
+
 
         left_dist = min(front_left, rear_left)
         right_dist = min(front_right, rear_right)
@@ -355,7 +430,7 @@ class BookTargetNode(Node):
         candidates = {
             'left': left_dist,
             'right': right_dist,
-            
+
         }
         valid_candidates = {
             position: distance
@@ -365,7 +440,7 @@ class BookTargetNode(Node):
         self.get_logger().info(
             f'[STEP 3] LiDAR distances: left={left_dist:.2f}m, '
             f'right={right_dist:.2f}m, '
-          
+
             f'valid={list(valid_candidates)}',
             throttle_duration_sec=2.0,
         )
@@ -416,7 +491,7 @@ class BookTargetNode(Node):
             regions, _ = mser.detectRegions(enhanced)
         except cv2.error:
             return None
-        
+
         for pts in regions:
             x, y, w, h = cv2.boundingRect(pts.reshape(-1, 1, 2))
             if 10 < h < 150 and 0.2 < (w / float(h)) < 1.4:
@@ -440,21 +515,57 @@ class BookTargetNode(Node):
         pred = int(np.argmax(probs))
         return str(pred) if 1 <= pred <= 5 else None
 
-    def _scan_for_target_book(self, frame, col_box):
+    def _scan_column_books(self, frame, col_box):
+        """Locate every coloured book sitting under the target column marker.
+
+        Each column holds exactly four books - one of each colour, one per
+        active row - so ranking what we find top-to-bottom by pixel y gives the
+        row index directly, with no camera intrinsics or TF lookup needed.
+
+        Returns {colour: (x, y, w, h)} in full-frame coordinates.
+        """
         x, y, w, h = col_box
         fh, fw = frame.shape[:2]
-        roi = frame[min(y + h, fh): min(y + h + 180, fh), max(x - 30, 0): min(x + w + 30, fw)]
+        top = min(y + h, fh)
+        # The four active rows span roughly a metre of shelf; 420 px covers
+        # them at the distances this runs at, where the old 180 px could clip
+        # the lower rows out of the search.
+        bottom = min(y + h + 420, fh)
+        left = max(x - 30, 0)
+        right = min(x + w + 30, fw)
+
+        roi = frame[top:bottom, left:right]
         if roi.size == 0:
-            return None
+            return {}
+
         hsv = cv2.cvtColor(roi, cv2.COLOR_BGR2HSV)
-        mask = np.zeros(hsv.shape[:2], dtype=np.uint8)
-        for low, high in self.color_ranges.get(self.book_colour, []):
-            mask |= cv2.inRange(hsv, np.array(low), np.array(high))
-        contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-        valid = [c for c in contours if cv2.contourArea(c) >= 100.0]
-        if valid:
+        found = {}
+        for colour, ranges in self.color_ranges.items():
+            mask = np.zeros(hsv.shape[:2], dtype=np.uint8)
+            for low, high in ranges:
+                mask |= cv2.inRange(hsv, np.array(low), np.array(high))
+            contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+            valid = [c for c in contours if cv2.contourArea(c) >= 100.0]
+            if not valid:
+                continue
             bx, by, bw, bh = cv2.boundingRect(max(valid, key=cv2.contourArea))
-            return (max(x - 30, 0) + bx + bw // 2, min(y + h, fh) + by + bh // 2)
+            found[colour] = (left + bx, top + by, bw, bh)
+        return found
+
+    def _row_for_colour(self, books, colour):
+        """Rank the detected books top-to-bottom and return the target's row."""
+        if colour not in books:
+            return None
+
+        ordered = sorted(books.items(), key=lambda item: item[1][1])
+        if len(ordered) < 4:
+            self.get_logger().warn(
+                f"[SCORE] Only {len(ordered)} of 4 books visible in the column - "
+                "the row index is an estimate."
+            )
+        for index, (name, _) in enumerate(ordered):
+            if name == colour:
+                return index + self.row_index_base
         return None
 
     def _publish_shelf_approach_pose(self):
@@ -526,25 +637,75 @@ class BookTargetNode(Node):
                 ranges.append(np.min(r))
         return float(np.mean(ranges)) if ranges else float('inf')
 
-    def _save_column_image(self, frame, col_box):
-        x, y, w, h = col_box
-        img = frame.copy()
-        cv2.rectangle(img, (x, y), (x + w, y + h), (0, 255, 0), 2)
-        filename = f"detected_column_{self.get_clock().now().nanoseconds}.png"
-        cv2.imwrite(filename, img)
-        self.image1_path = os.path.abspath(filename)
-        self.get_logger().info(f"[STEP 5] shelf column image---> '{filename}' saved.")
-        
+    # =========================================================================
+    # ANNOTATED IMAGE OUTPUT
+    # =========================================================================
+    def _stamp_image(self, img):
+        """Burn a timestamp into the frame.
 
-    def _save_final_annotated_image(self, frame, col_box, book_center):
+        The spec requires every saved image to carry one so the committee can
+        verify it was captured live during the trial rather than prepared
+        beforehand. We write both wall-clock and simulation time.
+        """
+        sim_seconds = self.get_clock().now().nanoseconds / 1e9
+        wall = datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+        label = f"{wall}   sim_t={sim_seconds:.3f}s"
+
+        height, width = img.shape[:2]
+        cv2.rectangle(img, (0, height - 26), (width, height), (0, 0, 0), -1)
+        cv2.putText(
+            img, label, (6, height - 8), cv2.FONT_HERSHEY_SIMPLEX,
+            0.45, (255, 255, 255), 1, cv2.LINE_AA
+        )
+        return img
+
+    def _write_image(self, img, prefix):
+        filename = os.path.join(
+            self.images_dir, f"{prefix}_{self.get_clock().now().nanoseconds}.png"
+        )
+        if not cv2.imwrite(filename, img):
+            self.get_logger().error(f"[IMAGE] Failed to write {filename}")
+            return None
+        return os.path.abspath(filename)
+
+    def _save_column_image(self, frame, col_box):
+        """Bounding box around the target shelf column (+2 points)."""
+        x, y, w, h = col_box
         img = frame.copy()
+        cv2.rectangle(img, (x, y), (x + w, y + h), (0, 255, 0), 2)
+        cv2.putText(
+            img, f"column {self.shelf_column_number}", (x, max(14, y - 8)),
+            cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2, cv2.LINE_AA
+        )
+        self._stamp_image(img)
+
+        self.image1_path = self._write_image(img, 'detected_column')
+        if self.image1_path:
+            self.column_image_saved = True
+            self.get_logger().info(f"[STEP 5] Column image saved: {self.image1_path}")
+
+    def _save_final_annotated_image(self, frame, col_box, book_box, row=None):
+        """Bounding box around the target book (+2 points)."""
+        img = frame.copy()
+
         x, y, w, h = col_box
         cv2.rectangle(img, (x, y), (x + w, y + h), (0, 255, 0), 2)
-        cv2.circle(img, book_center, 5, (0, 0, 255), -1)
-        filename = f"detected_book_{self.get_clock().now().nanoseconds}.png"
-        cv2.imwrite(filename, img)
-        self.image2_path = os.path.abspath(filename)
-        self.get_logger().info(f"[LOG] Image 1: {self.image1_path} | Image 2: {self.image2_path}")
+
+        bx, by, bw, bh = book_box
+        cv2.rectangle(img, (bx, by), (bx + bw, by + bh), (0, 0, 255), 2)
+        caption = f"{self.book_colour} book"
+        if row is not None:
+            caption += f" (row {row})"
+        cv2.putText(
+            img, caption, (bx, max(14, by - 8)),
+            cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 255), 2, cv2.LINE_AA
+        )
+        self._stamp_image(img)
+
+        self.image2_path = self._write_image(img, 'detected_book')
+        self.get_logger().info(
+            f"[LOG] Image 1: {self.image1_path} | Image 2: {self.image2_path}"
+        )
 
 
 def main(args=None):

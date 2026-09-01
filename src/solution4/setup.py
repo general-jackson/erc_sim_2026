@@ -6,7 +6,7 @@ package_name = 'solution4'
 
 setup(
     name=package_name,
-    version='0.0.0',
+    version='0.1.0',
     packages=find_packages(exclude=['test']),
     data_files=[
         ('share/ament_index/resource_index/packages',
@@ -20,8 +20,13 @@ setup(
     zip_safe=True,
     maintainer='mffin53',
     maintainer_email='mffin53@todo.todo',
-    description='TODO: Package description',
-    license='TODO: License declaration',
+    description=(
+        'Emirates Robotics Competition 2026 Phase 1 entry: a Library Assistant '
+        'Robot for TIAGo Pro that identifies the target shelf column from its '
+        'overhead digit marker, locates the requested book by colour, and '
+        'navigates between the shelf and the collection bin.'
+    ),
+    license='Apache-2.0',
     extras_require={
         'test': [
             'pytest',
@@ -35,4 +40,3 @@ setup(
         ],
     },
 )
-
