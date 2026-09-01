@@ -1,0 +1,26 @@
+# --- colcon / ROS 2 build artifacts ---
+build/
+install/
+log/
+
+# --- Python ---
+__pycache__/
+*.py[cod]
+*.egg-info/
+
+# --- Windows NTFS alternate-data-stream junk (from copying off C:) ---
+*:Zone.Identifier
+
+# --- Trial outputs ---
+# The erc_images/ folder itself is tracked (the spec requires it to exist in
+# the repo); the annotated PNGs written during each trial are not.
+erc_images/*
+!erc_images/.gitkeep
+
+# Loose detection images from before erc_images/ existed
+/detected_*.png
+
+# --- Editors ---
+.vscode/
+.idea/
+*.swp
