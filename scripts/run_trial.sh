@@ -72,10 +72,14 @@ echo '--- /erc/shelf_column_identification ---'
 timeout 20 ros2 topic echo --once --no-daemon --spin-time 5 /erc/shelf_column_identification std_msgs/msg/Int32 2>&1 | head -2
 echo '--- /erc/shelf_row_identification ---'
 timeout 20 ros2 topic echo --once --no-daemon --spin-time 5 /erc/shelf_row_identification std_msgs/msg/Int32 2>&1 | head -2
+echo '--- /erc/nav_status ---'
+timeout 20 ros2 topic echo --once --no-daemon --spin-time 5 /erc/nav_status std_msgs/msg/String 2>&1 | head -2
 echo '--- erc_images/ ---'
 ls -1 /opt/erc_ws/src/erc_images/ 2>/dev/null
 echo '--- pipeline log ---'
-grep node1_search /tmp/sol.log | grep -E 'SCORE|STEP 5|STEP 7|STEP 9|Candidate' | tail -12"
+grep node1_search /tmp/sol.log | grep -E 'SCORE|STEP 5|STEP 7|STEP 9|Candidate' | tail -12
+echo '--- drive to the column ---'
+grep node2_navigation /tmp/sol.log | grep -E 'Goal anchored|In position|standoff reached|SUCCESS|FAILURE|STATUS' | tail -6"
 
 say "Images are on the host at src/erc_images/ (written as root; sudo chown if git complains)"
 

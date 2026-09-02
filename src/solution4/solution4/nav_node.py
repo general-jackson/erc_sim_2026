@@ -75,7 +75,16 @@ class NavigationNode(Node):
         self.tf_buffer = tf2_ros.Buffer()
         self.tf_listener = tf2_ros.TransformListener(self.tf_buffer, self)
 
-        self.status_pub = self.create_publisher(String, '/erc/nav_status', 10)
+        # Latched, like node 1's scoring topics: the status is published once,
+        # tens of seconds before anyone goes looking for it, and a volatile
+        # publisher leaves a later subscriber with nothing to read.
+        latched_qos = QoSProfile(
+            depth=1,
+            reliability=QoSReliabilityPolicy.RELIABLE,
+            durability=QoSDurabilityPolicy.TRANSIENT_LOCAL,
+            history=QoSHistoryPolicy.KEEP_LAST,
+        )
+        self.status_pub = self.create_publisher(String, '/erc/nav_status', latched_qos)
         self.cmd_vel_pub = self.create_publisher(Twist, '/cmd_vel', 10)
 
         # Node 1 latches this pose, so a queue is enough to catch it even if
