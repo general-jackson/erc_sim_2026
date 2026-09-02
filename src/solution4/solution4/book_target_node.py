@@ -21,11 +21,15 @@ from rclpy.qos import (
 )
 
 from geometry_msgs.msg import PointStamped, PoseStamped, Twist
-from sensor_msgs.msg import Image, LaserScan, Imu
+from sensor_msgs.msg import Image, LaserScan, Imu, CameraInfo
 from std_msgs.msg import Int32
 from trajectory_msgs.msg import JointTrajectory, JointTrajectoryPoint
 from builtin_interfaces.msg import Time
 from ament_index_python.packages import get_package_share_directory
+from rclpy.time import Time as RclpyTime
+from rclpy.duration import Duration as RclpyDuration
+import tf2_ros
+import tf2_geometry_msgs  # noqa: F401  - registers PointStamped with the TF buffer
 
 
 class BookTargetNode(Node):
@@ -61,17 +65,64 @@ class BookTargetNode(Node):
         self.declare_parameter('row_index_base', 1)
         self.row_index_base = int(self.get_parameter('row_index_base').value)
 
-        # Digit-detection gating. The classifier labels every candidate region
-        # it is handed, so a confidence floor plus agreement across consecutive
-        # frames is what separates a real overhead marker from a passing blob.
+        # Digit-detection gating. The classifier was trained to tell digits
+        # apart, not to decide whether a region is a digit at all, so it labels
+        # whatever it is handed with high confidence. What keeps it honest is
+        # never showing it anything but the inside of a confirmed marker plate;
+        # the floor and the agreement across frames are a backstop, not the
+        # discriminator.
         self.declare_parameter('digit_confidence', 0.90)
         self.declare_parameter('digit_confirm_frames', 3)
         # Fraction of the frame height, measured from the top, that the digit
-        # search is allowed to look at.
+        # search looks at. The markers sit at z = 2.26 m so this is a cheap way
+        # to skip most of the frame; it is no longer what rejects false
+        # positives, and can be widened to 1.0 at the cost of some work.
         self.declare_parameter('digit_search_band', 0.5)
+
+        # Marker plate geometry. Each plate is a 0.3 m square whose texture is
+        # a tight crop of the digit stretched to fill it, so the glyph covers
+        # roughly 0.78 of the plate's width and 0.83 of its height and sits
+        # centred, with only a thin margin around it. Confirming a plate means
+        # segmenting its flat face, checking the result is a quadrilateral of
+        # about the right shape, and checking the glyph fills it in that
+        # proportion - tests the grippers, the shelf uprights and the lettering
+        # on the hall banner all fail on shape rather than on brightness.
+        #
+        # The tolerance is tight because it has to be: the plate face and the
+        # shelf top it rests on are only about eleven grey levels apart, so a
+        # looser band grows straight through the join and swallows the shelf.
+        # It is safe to be that tight because the value is measured from the
+        # plate itself each time, never assumed.
+        self.declare_parameter('glyph_max_level', 90)       # a printed glyph is near-black
+        self.declare_parameter('glyph_max_fill', 0.80)      # a solid block is not a digit
+        self.declare_parameter('plate_tolerance', 8.0)
+        self.declare_parameter('plate_min_contrast', 40.0)
+        self.declare_parameter('plate_min_rect_fill', 0.80)  # a plate fills its own bounding rect
+        self.declare_parameter('plate_aspect_min', 0.55)
+        self.declare_parameter('plate_aspect_max', 1.90)
+        self.declare_parameter('plate_glyph_span_min', 0.55)
+        self.declare_parameter('plate_glyph_span_max', 0.97)
+        self.declare_parameter('plate_glyph_offset', 0.15)   # glyph must sit near the centre
+        self.declare_parameter('plate_frame_margin', 2)
+
         self.digit_confidence = float(self.get_parameter('digit_confidence').value)
         self.digit_confirm_frames = int(self.get_parameter('digit_confirm_frames').value)
         self.digit_search_band = float(self.get_parameter('digit_search_band').value)
+        self.glyph_max_level = int(self.get_parameter('glyph_max_level').value)
+        self.glyph_max_fill = float(self.get_parameter('glyph_max_fill').value)
+        self.plate_tolerance = float(self.get_parameter('plate_tolerance').value)
+        self.plate_min_contrast = float(self.get_parameter('plate_min_contrast').value)
+        self.plate_min_rect_fill = float(self.get_parameter('plate_min_rect_fill').value)
+        self.plate_aspect = (
+            float(self.get_parameter('plate_aspect_min').value),
+            float(self.get_parameter('plate_aspect_max').value),
+        )
+        self.plate_glyph_span = (
+            float(self.get_parameter('plate_glyph_span_min').value),
+            float(self.get_parameter('plate_glyph_span_max').value),
+        )
+        self.plate_glyph_offset = float(self.get_parameter('plate_glyph_offset').value)
+        self.plate_frame_margin = int(self.get_parameter('plate_frame_margin').value)
         self._digit_streak = 0
         self._last_digit_confidence = 0.0
 
@@ -111,6 +162,12 @@ class BookTargetNode(Node):
 
         self.ROTATE_SPEED = 0.4
         self.SHELF_APPROACH_STANDOFF_M = 0.6
+        # Where the identified column stands, in the base frame. Set once
+        # the column is recognised and used to aim the approach pose so the
+        # base arrives in front of that column rather than wherever it
+        # happened to be facing.
+        self.column_point_base = None
+        self.camera_k = None
         self.shelf_approach_pose_sent = False
 
         # Annotated images must land in erc_images/ inside the team repository
@@ -130,7 +187,6 @@ class BookTargetNode(Node):
 
         # OpenCV Resources
         self.bridge = CvBridge()
-        self.clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8, 8))
         self.color_ranges = {
             'red': [((0, 100, 100), (10, 255, 255)), ((160, 100, 100), (180, 255, 255))],
             'blue': [((100, 100, 100), (140, 255, 255))],
@@ -175,6 +231,17 @@ class BookTargetNode(Node):
             [self.colour_sub, self.depth_sub], queue_size=10, slop=0.1
         )
         self.camera_sync.registerCallback(self.rgbd_callback)
+
+        # Intrinsics, for turning the marker plate's pixel into a bearing.
+        self.create_subscription(
+            CameraInfo,
+            '/head_front_camera/head_front_camera/depth/camera_info',
+            self._on_camera_info,
+            camera_qos,
+        )
+
+        self.tf_buffer = tf2_ros.Buffer()
+        self.tf_listener = tf2_ros.TransformListener(self.tf_buffer, self)
 
         # LiDAR & IMU Subscriptions
         lidar_qos = QoSProfile(
@@ -368,6 +435,7 @@ class BookTargetNode(Node):
                 # image - which is why the run used to spin past the shelf
                 # without ever finding the book.
                 self._stop_robot()
+                self.column_point_base = self._column_point_in_base(depth_msg, col_box)
                 self._publish_column_identification()
                 self._save_column_image(frame, col_box)
                 self.get_logger().info(f"[STEP 5] Digit '{self.shelf_column_number}' recognized.")
@@ -547,62 +615,202 @@ class BookTargetNode(Node):
         self.previous_patch_depth = curr_depth
         return diff >= 1.3
 
-    def _deskew_roi(self, gray_roi, pts):
-        """Aligns rotated text contours straight before feeding to the CNN."""
-        rect = cv2.minAreaRect(pts)
-        angle = rect[-1]
-        angle = -(90 + angle) if angle < -45 else -angle
-        h, w = gray_roi.shape[:2]
-        M = cv2.getRotationMatrix2D((w // 2, h // 2), angle, 1.0)
-        return cv2.warpAffine(
-            gray_roi, M, (w, h), flags=cv2.INTER_CUBIC, borderMode=cv2.BORDER_REPLICATE
-        )
+    # Side of the square a confirmed plate is rectified onto before reading.
+    PLATE_RECTIFIED_PX = 64
+
+    def _glyph_blobs(self, gray):
+        """Near-black connected regions that could be a printed glyph."""
+        dark = (gray < self.glyph_max_level).astype(np.uint8)
+        count, labels, stats, _ = cv2.connectedComponentsWithStats(dark, 8)
+        for i in range(1, count):
+            x, y, w, h, area = stats[i]
+            if area < 40 or w < 4 or h < 6:
+                continue
+            if not 0.15 < w / float(h) < 1.5:
+                continue
+            # A glyph leaves gaps inside its bounding box; a shelf upright or a
+            # shadow fills its own box almost completely.
+            if area / float(w * h) > self.glyph_max_fill:
+                continue
+            yield (x, y, w, h), (labels == i)
+
+    def _plate_grey(self, gray, glyph):
+        """The plate's own grey, read from a ring just clear of the glyph.
+
+        Measured every time rather than assumed, because how bright a plate
+        renders depends on where the robot is standing. Sampled a couple of
+        pixels out so the glyph's anti-aliased rim does not drag it down.
+        """
+        kernel = np.ones((3, 3), np.uint8)
+        outer = cv2.dilate(glyph.astype(np.uint8), kernel, iterations=3).astype(bool)
+        inner = cv2.dilate(glyph.astype(np.uint8), kernel, iterations=1).astype(bool)
+        ring = gray[outer & ~inner]
+        return float(np.median(ring)) if ring.size >= 12 else None
+
+    @staticmethod
+    def _order_quad(pts):
+        """Corners as top-left, top-right, bottom-right, bottom-left."""
+        total, diff = pts.sum(axis=1), np.diff(pts, axis=1).ravel()
+        return np.array([pts[np.argmin(total)], pts[np.argmin(diff)],
+                         pts[np.argmax(total)], pts[np.argmax(diff)]], dtype=np.float32)
+
+    def _find_marker_plates(self, gray):
+        """Locate the 0.3 m marker plates, before anything is classified.
+
+        Measured on the raw greyscale, never a CLAHE-equalised copy: a plate
+        reads as a flat grey distinctly darker than the wall behind it, and
+        equalisation destroys exactly that separation.
+
+        Returns a list of dicts with the plate's bounding box, its corners and
+        the rectified square that the classifier is later shown.
+        """
+        height, width = gray.shape[:2]
+        margin = self.plate_frame_margin
+        side = self.PLATE_RECTIFIED_PX
+        found = []
+
+        for (x, y, w, h), glyph in self._glyph_blobs(gray):
+            # The plate always extends past the glyph, so a glyph touching the
+            # frame edge sits on a plate that is certainly cut off. Such a
+            # marker is useless even when read correctly - the shelf column
+            # beneath it is off-screen, leaving the book search nothing to rank.
+            if (x <= margin or y <= margin
+                    or x + w >= width - margin or y + h >= height - margin):
+                continue
+            plate_grey = self._plate_grey(gray, glyph)
+            if plate_grey is None:
+                continue
+
+            # Grow the plate's face out from the glyph, inside a window a
+            # couple of glyph-widths across so a same-coloured surface further
+            # off cannot be joined onto it.
+            pad = int(max(w, h) * 0.8) + 6
+            x0, x1 = max(0, x - pad), min(width, x + w + pad)
+            y0, y1 = max(0, y - pad), min(height, y + h + pad)
+            window = gray[y0:y1, x0:x1]
+            face = (np.abs(window.astype(np.int16) - plate_grey) <= self.plate_tolerance)
+            face |= glyph[y0:y1, x0:x1]
+            face = cv2.morphologyEx(
+                face.astype(np.uint8), cv2.MORPH_CLOSE, np.ones((3, 3), np.uint8)
+            )
+
+            count, labels, stats, _ = cv2.connectedComponentsWithStats(face, 8)
+            seed = labels[y - y0 + h // 2, x - x0 + w // 2]
+            if seed == 0:
+                ids = labels[glyph[y0:y1, x0:x1]]
+                ids = ids[ids > 0]
+                if ids.size == 0:
+                    continue
+                seed = int(np.bincount(ids).argmax())
+            contours, _ = cv2.findContours(
+                (labels == seed).astype(np.uint8), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
+            )
+            if not contours:
+                continue
+            contour = max(contours, key=cv2.contourArea)
+
+            rect = cv2.minAreaRect(contour)
+            rw, rh = rect[1]
+            if rw < 8 or rh < 8:
+                continue
+            aspect = rw / rh
+            # A plate is solid, so it fills its own minimum-area rectangle. A
+            # region that merely happens to be the right colour does not.
+            rect_fill = cv2.contourArea(contour) / (rw * rh)
+            if not self.plate_aspect[0] <= aspect <= self.plate_aspect[1]:
+                continue
+            if rect_fill < self.plate_min_rect_fill:
+                continue
+
+            # Rectify the plate onto a square. It is one in the world, so this
+            # undoes the tilt and foreshortening of a plate seen from an angle
+            # and presents near and far markers at the same scale. It also
+            # makes the checks below rotation-invariant.
+            quad = self._order_quad(cv2.boxPoints(rect) + np.array([x0, y0], np.float32))
+            target = np.array([[0, 0], [side - 1, 0],
+                               [side - 1, side - 1], [0, side - 1]], dtype=np.float32)
+            flat = cv2.warpPerspective(
+                gray, cv2.getPerspectiveTransform(quad, target), (side, side)
+            )
+
+            ink = (flat < self.glyph_max_level).astype(np.uint8)
+            gcount, glabels, gstats, _ = cv2.connectedComponentsWithStats(ink, 8)
+            if gcount < 2:
+                continue
+            biggest = 1 + int(np.argmax(gstats[1:, cv2.CC_STAT_AREA]))
+            gx, gy, gw, gh = gstats[biggest, :4]
+            span_x, span_y = gw / float(side), gh / float(side)
+            off_x = abs((gx + gw / 2.0) / side - 0.5)
+            off_y = abs((gy + gh / 2.0) / side - 0.5)
+
+            body = (glabels == biggest)
+            around = flat[~cv2.dilate(
+                body.astype(np.uint8), np.ones((3, 3), np.uint8), iterations=2
+            ).astype(bool)]
+            if around.size < 30:
+                continue
+            contrast = float(np.median(around)) - float(np.median(flat[body]))
+
+            if contrast < self.plate_min_contrast:
+                continue
+            if not self.plate_glyph_span[0] <= span_x <= self.plate_glyph_span[1]:
+                continue
+            if not self.plate_glyph_span[0] <= span_y <= self.plate_glyph_span[1]:
+                continue
+            if off_x > self.plate_glyph_offset or off_y > self.plate_glyph_offset:
+                continue
+
+            found.append({
+                'bbox': cv2.boundingRect(quad.astype(np.int32)),
+                'quad': quad,
+                'flat': flat,
+            })
+        return found
+
+    def _read_plate(self, flat):
+        """Classify the glyph on a rectified plate, or None if unconvincing."""
+        _, ink = cv2.threshold(flat, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
+        count, labels, stats, _ = cv2.connectedComponentsWithStats(ink, 8)
+        if count < 2:
+            return None
+        biggest = 1 + int(np.argmax(stats[1:, cv2.CC_STAT_AREA]))
+        x, y, w, h = stats[biggest, :4]
+        glyph = (labels[y:y + h, x:x + w] == biggest).astype(np.uint8) * 255
+        return self._predict_digit(glyph)
 
     def _scan_for_column_digit(self, frame):
+        """Return the bounding box of the plate carrying the column number.
+
+        Plates are confirmed geometrically first and the classifier only ever
+        sees the inside of one, so a region that is not a marker is rejected on
+        its shape rather than on the network's opinion of it.
+        """
         if self.net is None or frame is None:
             return None
 
         gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-        enhanced = self.clahe.apply(gray)
+        search_height = max(1, int(gray.shape[0] * self.digit_search_band))
+        band = gray[0:search_height, :]
 
-        # The markers sit on plates at z = 2.26 m, above the 2.10 m shelf, so
-        # they only ever appear in the upper part of the frame. The robot's own
-        # grippers sit mid-frame and the classifier labels them as digits with
-        # high confidence, so restricting the search band is what actually
-        # rejects them - a confidence floor alone does not.
-        search_height = max(1, int(enhanced.shape[0] * self.digit_search_band))
-        band = enhanced[0:search_height, :]
-
-        mser = cv2.MSER_create(min_area=60, max_area=14000)
-        try:
-            regions, _ = mser.detectRegions(band)
-        except cv2.error:
-            return None
-
-        for pts in regions:
-            x, y, w, h = cv2.boundingRect(pts.reshape(-1, 1, 2))
-            if 10 < h < 150 and 0.2 < (w / float(h)) < 1.4:
-                roi_gray = band[y:y + h, x:x + w]
-                deskew_roi = self._deskew_roi(roi_gray, pts)
-                digit = self._predict_digit(deskew_roi)
-                if digit == self.shelf_column_number:
-                    # Band starts at row 0, so frame and band coordinates agree.
-                    return (x, y, w, h)
+        for plate in self._find_marker_plates(band):
+            if self._read_plate(plate['flat']) == self.shelf_column_number:
+                # The band starts at row 0, so band and frame coordinates agree.
+                return plate['bbox']
         return None
 
-    def _predict_digit(self, roi):
-        """Classify a candidate region, rejecting anything unconvincing.
+    def _predict_digit(self, glyph):
+        """Classify an isolated glyph, rejecting anything unconvincing.
 
-        The network assigns every region some class, so without a confidence
-        floor an arbitrary grey blob - the robot's own gripper, for instance -
-        scores as a digit and the run commits to a column that is not there.
+        The network assigns every region it is shown some class, so the
+        confidence floor stays as a backstop. It is no longer what keeps
+        non-digits out - _find_marker_plates is, by never handing this
+        anything that is not the inside of a marker plate.
         """
-        _, thresh = cv2.threshold(roi, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
-        h, w = thresh.shape[:2]
+        h, w = glyph.shape[:2]
         scale = 20.0 / max(h, w)
         nw, nh = max(1, int(w * scale)), max(1, int(h * scale))
         canvas = np.zeros((28, 28), dtype=np.uint8)
-        canvas[(28 - nh) // 2: (28 - nh) // 2 + nh, (28 - nw) // 2: (28 - nw) // 2 + nw] = cv2.resize(thresh, (nw, nh))
+        canvas[(28 - nh) // 2: (28 - nh) // 2 + nh, (28 - nw) // 2: (28 - nw) // 2 + nw] = cv2.resize(glyph, (nw, nh))
         blob = cv2.dnn.blobFromImage(canvas, 1.0 / 255.0, (28, 28))
         self.net.setInput(blob)
 
@@ -674,15 +882,101 @@ class BookTargetNode(Node):
         return None
 
     def _publish_shelf_approach_pose(self):
-        fwd_dist = self._average_sector_min(-10.0, 10.0)
-        approach = max(0.0, fwd_dist - self.SHELF_APPROACH_STANDOFF_M) if math.isfinite(fwd_dist) else 0.0
-
         pose = PoseStamped()
         pose.header.frame_id = 'base_link'
         pose.header.stamp = self.get_clock().now().to_msg()
-        pose.pose.position.x = float(approach)
         pose.pose.orientation.w = 1.0
+
+        if self.column_point_base is not None:
+            # Stand off in front of the column itself. The base is holonomic,
+            # so the sideways component costs nothing and is what actually
+            # earns "navigate to the column" - driving straight ahead only
+            # reaches whichever column the robot happened to stop facing.
+            forward = self.column_point_base.point.x - self.SHELF_APPROACH_STANDOFF_M
+            pose.pose.position.x = float(max(0.0, forward))
+            pose.pose.position.y = float(self.column_point_base.point.y)
+        else:
+            # Fallback: no depth or no TF for the plate, so approach on LiDAR
+            # alone and accept whatever column that lands in front of.
+            fwd_dist = self._average_sector_min(-10.0, 10.0)
+            approach = (max(0.0, fwd_dist - self.SHELF_APPROACH_STANDOFF_M)
+                        if math.isfinite(fwd_dist) else 0.0)
+            pose.pose.position.x = float(approach)
+            self.get_logger().warn(
+                '[STEP 7] Column position unknown - approaching straight ahead.'
+            )
+
+        self.get_logger().info(
+            f'[STEP 7] Approach pose: x={pose.pose.position.x:.2f}m, '
+            f'y={pose.pose.position.y:+.2f}m in base_link.'
+        )
         self.shelf_approach_pub.publish(pose)
+
+    def _on_camera_info(self, msg):
+        self.camera_k = (msg.k[0], msg.k[4], msg.k[2], msg.k[5])  # fx, fy, cx, cy
+
+    def _column_point_in_base(self, depth_msg, col_box):
+        """Where the identified column stands, as a point in the base frame.
+
+        The marker plate sits directly above its column, so deprojecting the
+        plate's centre gives the column's position without needing to see the
+        shelf itself. Depth and colour are published at the same resolution and
+        with the same intrinsics here, so the plate's pixel in the colour image
+        indexes the depth image directly.
+
+        Returns None if the depth there is missing or TF is not ready, in which
+        case the caller falls back to driving straight ahead.
+        """
+        if self.camera_k is None:
+            self.get_logger().warn('[STEP 7] No camera_info yet; cannot locate the column.')
+            return None
+
+        try:
+            depth = self.bridge.imgmsg_to_cv2(depth_msg, desired_encoding='passthrough')
+        except Exception as exc:
+            self.get_logger().warn(f'[STEP 7] Depth image unreadable: {exc}')
+            return None
+
+        x, y, w, h = col_box
+        u, v = x + w // 2, y + h // 2
+        dh, dw = depth.shape[:2]
+        if not (0 <= u < dw and 0 <= v < dh):
+            return None
+
+        # Median of a small patch, so one dropped pixel on the plate's edge
+        # does not decide where the robot drives.
+        half = 3
+        patch = depth[max(0, v - half):min(dh, v + half + 1),
+                      max(0, u - half):min(dw, u + half + 1)].astype(np.float32)
+        valid = patch[np.isfinite(patch) & (patch > 0.05)]
+        if valid.size < 4:
+            self.get_logger().warn('[STEP 7] No usable depth on the marker plate.')
+            return None
+        z = float(np.median(valid))
+
+        fx, fy, cx, cy = self.camera_k
+        point = PointStamped()
+        point.header.frame_id = depth_msg.header.frame_id
+        # Zero stamp asks for the latest transform. The base is already stopped
+        # by the time this runs, so latest and exact agree.
+        point.header.stamp = RclpyTime().to_msg()
+        point.point.x = (u - cx) * z / fx
+        point.point.y = (v - cy) * z / fy
+        point.point.z = z
+
+        try:
+            in_base = self.tf_buffer.transform(
+                point, 'base_link', timeout=RclpyDuration(seconds=2.0)
+            )
+        except Exception as exc:
+            self.get_logger().warn(f'[STEP 7] {point.header.frame_id} -> base_link failed: {exc}')
+            return None
+
+        self.get_logger().info(
+            f'[STEP 7] Column {self.shelf_column_number} is at '
+            f'x={in_base.point.x:.2f}m, y={in_base.point.y:+.2f}m in the base frame.'
+        )
+        return in_base
 
     def _stop_robot(self):
         self.is_rotating = False

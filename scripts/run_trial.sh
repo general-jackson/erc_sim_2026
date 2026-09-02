@@ -17,7 +17,10 @@ COLOUR="${2:-red}"
 SEED="${3:-42}"
 CONTAINER="erc_sim"
 SIM_WARMUP=30       # world populates on staggered timers: robot 3s, books 5s, controllers 8s
-TRIAL_SECONDS=150
+# Long enough to cover the whole pipeline with margin: the solution
+# reaches STEP 7 about 15s after launch and the drive to the shelf takes
+# another 40s. Raise it if a step downstream of navigation is added.
+TRIAL_SECONDS=90
 
 say() { printf '\n\033[1;34m[trial]\033[0m %s\n' "$*"; }
 
@@ -50,10 +53,15 @@ sleep "$TRIAL_SECONDS"
 
 say "Results"
 dexec "source /opt/erc_ws/install/setup.bash
+# The ros2 CLI daemon caches the ROS graph and does not survive the container
+# restart at the top of this script. A stale daemon reports no publishers, so
+# 'topic echo' below would print nothing on a perfectly good run. Stop it and
+# bypass it entirely - slower discovery, but the results are trustworthy.
+ros2 daemon stop >/dev/null 2>&1 || true
 echo '--- /erc/shelf_column_identification ---'
-timeout 6 ros2 topic echo --once /erc/shelf_column_identification std_msgs/msg/Int32 2>&1 | head -2
+timeout 20 ros2 topic echo --once --no-daemon --spin-time 5 /erc/shelf_column_identification std_msgs/msg/Int32 2>&1 | head -2
 echo '--- /erc/shelf_row_identification ---'
-timeout 6 ros2 topic echo --once /erc/shelf_row_identification std_msgs/msg/Int32 2>&1 | head -2
+timeout 20 ros2 topic echo --once --no-daemon --spin-time 5 /erc/shelf_row_identification std_msgs/msg/Int32 2>&1 | head -2
 echo '--- erc_images/ ---'
 ls -1 /opt/erc_ws/src/erc_images/ 2>/dev/null
 echo '--- pipeline log ---'
@@ -70,19 +78,39 @@ say "Images are on the host at src/erc_images/ (written as root; sudo chown if g
 #    books top-to-bottom, so seeing only one makes the rank meaningless. Treat
 #    any run carrying that warning as a column-only score.
 #
-# 2. Digit detection depends on the search band. The classifier labels the
-#    robot's own gripper as a digit with >0.9 confidence. What rejects it is
-#    digit_search_band (default 0.5 = top half of frame), because the markers
-#    sit at z=2.26m and the grippers do not. If detection starts failing,
-#    that parameter is the first thing to look at.
+# 2. Digit detection confirms the marker plate before classifying anything.
+#    Each plate is a 0.3m square whose texture is a tight crop of the digit
+#    stretched to fill it, so the glyph covers ~0.78 of the plate's width and
+#    ~0.83 of its height. The detector segments the plate's flat face, checks
+#    the result is a quadrilateral of about the right shape, rectifies it onto
+#    a square, and checks the glyph fills that square in the proportion above.
+#    Only then is anything classified. This replaced a stack of brightness and
+#    position filters that each rejected one false positive and revealed the
+#    next. digit_search_band still trims the search to the top of the frame,
+#    but it is an optimisation now, not what rejects the grippers.
 #
 # 3. The arms occlude the camera. STEP 1 swings both into view; only one arm
 #    is allowed for the task anyway, so tucking the unused one would free a
 #    large part of the frame.
 #
-# 4. Nothing downstream of detection is implemented: no grasp, no navigation
-#    to the bin, no placement. That is 10 of the 19 points.
+# 4. The base drives to the target column on odometry, not Nav2. The ERC
+#    simulation ships no Nav2 stack at all - no /navigate_to_pose, no map
+#    server, no AMCL, no costmaps - so goals in the 'map' frame failed on
+#    every run and the robot never moved. Node 1 deprojects the confirmed
+#    marker plate to a point in base_link and node 2 closes the loop on
+#    odometry and the front LiDAR, using the holonomic base to strafe into
+#    line with the column. Arrives ~0.09m off centre with ~0.43m clearance.
 #
-# 5. Software rendering only (no NVIDIA), so the camera runs ~10Hz against the
+# 5. Nothing downstream of navigation is implemented: no grasp, no drive to
+#    the bin, no placement. That is 10 of the 19 points.
+#
+# 6. The simulator sometimes starts up incomplete, and the run has to be
+#    thrown away rather than debugged. Seen twice, differently: once the
+#    camera never delivered a callback and the log stopped after STEP 1, once
+#    every LiDAR beam returned inf so STEP 3 never resolved the table. Both
+#    are upstream of any solution logic. Check the front scan is returning
+#    (818 beams, all finite when healthy) before blaming a change.
+#
+# 7. Software rendering only (no NVIDIA), so the camera runs ~10Hz against the
 #    30Hz spec. Timings here will not match the graders' machine.
 # ---------------------------------------------------------------------------
