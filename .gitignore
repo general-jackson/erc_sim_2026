@@ -12,10 +12,15 @@ __pycache__/
 *:Zone.Identifier
 
 # --- Trial outputs ---
-# The erc_images/ folder itself is tracked (the spec requires it to exist in
-# the repo); the annotated PNGs written during each trial are not.
-erc_images/*
-!erc_images/.gitkeep
+# The erc_images/ folder stays tracked (the spec requires it to exist in the
+# repo); the PNGs each trial writes do not.
+#
+# The leading ** matters. A gitignore pattern containing a slash is anchored to
+# the repo root, so a bare "erc_images/*" silently misses src/erc_images/ -
+# which is where the node actually writes, since only src/ is bind-mounted into
+# the container.
+**/erc_images/*
+!**/erc_images/.gitkeep
 
 # Loose detection images from before erc_images/ existed
 /detected_*.png
