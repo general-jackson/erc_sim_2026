@@ -4,6 +4,15 @@
 #   ./scripts/run_trial.sh [column] [colour] [seed]
 #   ./scripts/run_trial.sh 2 red 42        # defaults
 #
+# Set HEADLESS=false to watch it happen in the Gazebo window instead of only
+# reading the result:
+#
+#   HEADLESS=false ./scripts/run_trial.sh 2 red 42
+#
+# That needs an X server the container can reach - ./docker/up.sh arranges it
+# on this machine - and it is slower, because there is no GPU here and the
+# window is rendered in software.
+#
 # Run from the host (not inside the container). The container must already be
 # up: ./docker/up.sh
 #
@@ -16,6 +25,7 @@ COLUMN="${1:-2}"
 COLOUR="${2:-red}"
 SEED="${3:-42}"
 CONTAINER="erc_sim"
+HEADLESS="${HEADLESS:-true}"
 SIM_WARMUP=30       # world populates on staggered timers: robot 3s, books 5s, controllers 8s
 # Long enough to cover the whole pipeline with margin: the solution
 # reaches STEP 7 about 15s after launch and the drive to the shelf takes
@@ -40,9 +50,9 @@ dexec "rm -f /opt/erc_ws/src/erc_images/*.png /tmp/sol.log /tmp/sim.log"
 say "Building solution4"
 dexec "cd /opt/erc_ws && colcon build --symlink-install --packages-select solution4 2>&1 | tail -2"
 
-say "Starting simulator (headless, ERC_SEED=$SEED)"
+say "Starting simulator (headless=$HEADLESS, ERC_SEED=$SEED)"
 dexecd "cd /opt/erc_ws && source install/setup.bash && export ERC_SEED=$SEED && \
-        ros2 launch erc_bringup simulation.launch.py headless:=true > /tmp/sim.log 2>&1"
+        ros2 launch erc_bringup simulation.launch.py headless:=$HEADLESS > /tmp/sim.log 2>&1"
 sleep "$SIM_WARMUP"
 
 say "Running solution: column=$COLUMN colour=$COLOUR"
