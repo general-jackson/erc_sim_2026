@@ -65,6 +65,21 @@ class BookTargetNode(Node):
         self.declare_parameter('row_index_base', 1)
         self.row_index_base = int(self.get_parameter('row_index_base').value)
 
+        # Height of each active row's books above the floor, topmost first.
+        # From simulation.launch.py: books spawn at SHELF_Z (1.1) plus the
+        # row's offset, and ACTIVE_ROWS covers offsets 0.495, 0.165, -0.165
+        # and -0.495. The rows are 0.33 m apart and a book is 0.16 m tall, so
+        # a book's height names its row outright - which is what makes this
+        # work when only some of the column is visible.
+        self.declare_parameter('row_heights', [1.595, 1.265, 0.935, 0.605])
+        self.declare_parameter('row_height_tolerance', 0.16)
+        # Frame to measure that height in. base_footprint sits on the floor,
+        # so a point's z in it is height above the floor.
+        self.declare_parameter('row_reference_frame', 'base_footprint')
+        self.row_heights = [float(v) for v in self.get_parameter('row_heights').value]
+        self.row_height_tolerance = float(self.get_parameter('row_height_tolerance').value)
+        self.row_reference_frame = str(self.get_parameter('row_reference_frame').value)
+
         # Digit-detection gating. The classifier was trained to tell digits
         # apart, not to decide whether a region is a digit at all, so it labels
         # whatever it is handed with high confidence. What keeps it honest is
@@ -453,9 +468,12 @@ class BookTargetNode(Node):
                 # -------------------------------------------------------------
                 self._stop_robot()
 
-                # Row identification is derived from where this book sits among
-                # the other coloured books in the same column.
-                row = self._row_for_colour(books, self.book_colour)
+                # Row comes from the book's height where the depth allows
+                # it, because that holds even when the rest of the column is
+                # hidden. Ranking is the fallback, and says so in the log.
+                row = self._row_from_height(depth_msg, target_box)
+                if row is None:
+                    row = self._row_for_colour(books, self.book_colour)
                 if row is not None:
                     self._publish_row_identification(row)
 
@@ -866,7 +884,12 @@ class BookTargetNode(Node):
         return found
 
     def _row_for_colour(self, books, colour):
-        """Rank the detected books top-to-bottom and return the target's row."""
+        """Fallback row estimate: rank the detected books top to bottom.
+
+        Only correct when all four books in the column are visible, since a
+        missing one shifts every book below it up a rank. Used when the
+        book's height could not be measured - see _row_from_height.
+        """
         if colour not in books:
             return None
 
@@ -915,42 +938,37 @@ class BookTargetNode(Node):
     def _on_camera_info(self, msg):
         self.camera_k = (msg.k[0], msg.k[4], msg.k[2], msg.k[5])  # fx, fy, cx, cy
 
-    def _column_point_in_base(self, depth_msg, col_box):
-        """Where the identified column stands, as a point in the base frame.
+    def _deproject(self, depth_msg, box, target_frame):
+        """Turn the centre of a pixel box into a 3-D point in `target_frame`.
 
-        The marker plate sits directly above its column, so deprojecting the
-        plate's centre gives the column's position without needing to see the
-        shelf itself. Depth and colour are published at the same resolution and
-        with the same intrinsics here, so the plate's pixel in the colour image
-        indexes the depth image directly.
-
-        Returns None if the depth there is missing or TF is not ready, in which
-        case the caller falls back to driving straight ahead.
+        Depth and colour are published at the same resolution and with the same
+        intrinsics here, so a pixel in the colour image indexes the depth image
+        directly. Returns None if the depth there is missing or TF is not ready.
         """
         if self.camera_k is None:
-            self.get_logger().warn('[STEP 7] No camera_info yet; cannot locate the column.')
+            self.get_logger().warn('[DEPTH] No camera_info yet.', throttle_duration_sec=5.0)
             return None
 
         try:
             depth = self.bridge.imgmsg_to_cv2(depth_msg, desired_encoding='passthrough')
         except Exception as exc:
-            self.get_logger().warn(f'[STEP 7] Depth image unreadable: {exc}')
+            self.get_logger().warn(f'[DEPTH] Image unreadable: {exc}')
             return None
 
-        x, y, w, h = col_box
+        x, y, w, h = box
         u, v = x + w // 2, y + h // 2
         dh, dw = depth.shape[:2]
         if not (0 <= u < dw and 0 <= v < dh):
             return None
 
-        # Median of a small patch, so one dropped pixel on the plate's edge
-        # does not decide where the robot drives.
+        # Median of a small patch, so one dropped pixel at an edge does not
+        # decide the answer.
         half = 3
         patch = depth[max(0, v - half):min(dh, v + half + 1),
                       max(0, u - half):min(dw, u + half + 1)].astype(np.float32)
         valid = patch[np.isfinite(patch) & (patch > 0.05)]
         if valid.size < 4:
-            self.get_logger().warn('[STEP 7] No usable depth on the marker plate.')
+            self.get_logger().warn('[DEPTH] No usable depth at that pixel.')
             return None
         z = float(np.median(valid))
 
@@ -965,18 +983,61 @@ class BookTargetNode(Node):
         point.point.z = z
 
         try:
-            in_base = self.tf_buffer.transform(
-                point, 'base_link', timeout=RclpyDuration(seconds=2.0)
+            return self.tf_buffer.transform(
+                point, target_frame, timeout=RclpyDuration(seconds=2.0)
             )
         except Exception as exc:
-            self.get_logger().warn(f'[STEP 7] {point.header.frame_id} -> base_link failed: {exc}')
+            self.get_logger().warn(
+                f'[DEPTH] {point.header.frame_id} -> {target_frame} failed: {exc}'
+            )
             return None
 
+    def _column_point_in_base(self, depth_msg, col_box):
+        """Where the identified column stands, as a point in the base frame.
+
+        The marker plate sits directly above its column, so deprojecting the
+        plate's centre gives the column's position without needing to see the
+        shelf itself.
+        """
+        in_base = self._deproject(depth_msg, col_box, 'base_link')
+        if in_base is None:
+            return None
         self.get_logger().info(
             f'[STEP 7] Column {self.shelf_column_number} is at '
             f'x={in_base.point.x:.2f}m, y={in_base.point.y:+.2f}m in the base frame.'
         )
         return in_base
+
+    def _row_from_height(self, depth_msg, book_box):
+        """Which row a book is on, from how far off the floor it sits.
+
+        The four active rows are fixed heights 0.33 m apart, so a book's height
+        names its row on its own. Ranking the column's books top to bottom
+        needs all four of them in view, and one arm across the frame is enough
+        to break that - which is what the "row index is an estimate" warning
+        has been reporting.
+        """
+        point = self._deproject(depth_msg, book_box, self.row_reference_frame)
+        if point is None:
+            return None
+
+        height = point.point.z
+        nearest = min(range(len(self.row_heights)),
+                      key=lambda i: abs(self.row_heights[i] - height))
+        error = abs(self.row_heights[nearest] - height)
+        if error > self.row_height_tolerance:
+            self.get_logger().warn(
+                f'[SCORE] Book sits {height:.2f} m up, {error:.2f} m off the nearest '
+                'row - too far to call from height.'
+            )
+            return None
+
+        row = nearest + self.row_index_base
+        self.get_logger().info(
+            f'[SCORE] Book is {height:.2f} m off the floor, {error:.2f} m from the '
+            f'row at {self.row_heights[nearest]:.2f} m -> row {row}.'
+        )
+        return row
 
     def _stop_robot(self):
         self.is_rotating = False
