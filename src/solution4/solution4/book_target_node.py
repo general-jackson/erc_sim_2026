@@ -176,7 +176,15 @@ class BookTargetNode(Node):
         self.row_id_published = False
 
         self.ROTATE_SPEED = 0.4
-        self.SHELF_APPROACH_STANDOFF_M = 0.6
+        # Stand-off is measured to the marker plate, which is flush with the
+        # shelf edge, but the books sit 0.145 m further in (simulation.launch
+        # puts the plate at SHELF_X - 0.245 and the books at SHELF_X - 0.1).
+        # A 0.6 m stand-off therefore left the book 0.75 m away before any
+        # measurement error, and the arm reaches about 0.8 m at full stretch:
+        # a trial parked with the book at 1.76 m and no IK solution existed.
+        # This is deliberately shorter than the LiDAR stop distance in node 2,
+        # so the LiDAR is what actually halts the approach.
+        self.SHELF_APPROACH_STANDOFF_M = 0.35
         # Where the identified column stands, in the base frame. Set once
         # the column is recognised and used to aim the approach pose so the
         # base arrives in front of that column rather than wherever it

@@ -55,7 +55,11 @@ class NavigationNode(Node):
         self.declare_parameter('max_linear_speed', 0.25)     # m/s
         self.declare_parameter('max_yaw_speed', 0.30)        # rad/s
         self.declare_parameter('goal_tolerance', 0.10)       # m
-        self.declare_parameter('obstacle_stop_distance', 0.45)   # m, front LiDAR
+        # Books sit behind the shelf edge the LiDAR sees, so stopping here
+        # puts them about 0.70-0.76 m from base_link in practice. That is
+        # inside the arm's range for the lower rows; the top row needs about
+        # 0.50 m and is not reachable from this stand-off.
+        self.declare_parameter('obstacle_stop_distance', 0.40)   # m, front LiDAR
         self.declare_parameter('nav_timeout', 45.0)          # s
         self.declare_parameter('control_period', 0.1)        # s
 
