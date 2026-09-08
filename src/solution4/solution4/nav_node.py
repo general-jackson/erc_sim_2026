@@ -55,11 +55,13 @@ class NavigationNode(Node):
         self.declare_parameter('max_linear_speed', 0.25)     # m/s
         self.declare_parameter('max_yaw_speed', 0.30)        # rad/s
         self.declare_parameter('goal_tolerance', 0.10)       # m
-        # Books sit behind the shelf edge the LiDAR sees, so stopping here
-        # puts them about 0.70-0.76 m from base_link in practice. That is
-        # inside the arm's range for the lower rows; the top row needs about
-        # 0.50 m and is not reachable from this stand-off.
-        self.declare_parameter('obstacle_stop_distance', 0.40)   # m, front LiDAR
+        # A safety floor, measured from base_link now that the laser's corner
+        # mounting is accounted for - it sits 0.275 m forward, 0.183 m to the
+        # side and yawed 45 degrees, so rays near the scan's own zero angle
+        # point nowhere near the direction of travel. In practice the shelf
+        # stops the base at about 0.7 m so this rarely fires; it is here for
+        # anything that gets in the way on the drive over.
+        self.declare_parameter('obstacle_stop_distance', 0.45)   # m, ahead of base_link
         self.declare_parameter('nav_timeout', 45.0)          # s
         self.declare_parameter('control_period', 0.1)        # s
 
@@ -75,6 +77,7 @@ class NavigationNode(Node):
         self._started_at = None
         self._timer = None
         self._front_scan = None
+        self._laser_tf = None
 
         self.tf_buffer = tf2_ros.Buffer()
         self.tf_listener = tf2_ros.TransformListener(self.tf_buffer, self)
@@ -111,19 +114,68 @@ class NavigationNode(Node):
     def _on_front_scan(self, msg):
         self._front_scan = msg
 
-    def _front_clearance(self, half_angle_deg=10.0):
-        """Nearest return straight ahead, or inf if the LiDAR has not spoken."""
+    def _laser_placement(self):
+        """Where the front laser sits on the base, cached after the first look."""
+        if self._laser_tf is not None:
+            return self._laser_tf
         scan = self._front_scan
-        if scan is None or not scan.ranges:
+        if scan is None:
+            return None
+        try:
+            tf = self.tf_buffer.lookup_transform(
+                'base_link', scan.header.frame_id, Time())
+        except Exception as exc:
+            self.get_logger().warn(f'[NODE 2 TF] no {scan.header.frame_id}: {exc}',
+                                   throttle_duration_sec=5.0)
+            return None
+        t, q = tf.transform.translation, tf.transform.rotation
+        self._laser_tf = ((t.x, t.y, t.z), (q.x, q.y, q.z, q.w))
+        self.get_logger().info(
+            f'[NODE 2] Front laser at ({t.x:.3f}, {t.y:.3f}, {t.z:.3f}) on base_link.'
+        )
+        return self._laser_tf
+
+    @staticmethod
+    def _rotate(q, v):
+        """Rotate vector v by quaternion q = (x, y, z, w)."""
+        qx, qy, qz, qw = q
+        vx, vy, vz = v
+        tx = 2.0 * (qy * vz - qz * vy)
+        ty = 2.0 * (qz * vx - qx * vz)
+        tz = 2.0 * (qx * vy - qy * vx)
+        return (vx + qw * tx + (qy * tz - qz * ty),
+                vy + qw * ty + (qz * tx - qx * tz),
+                vz + qw * tz + (qx * ty - qy * tx))
+
+    def _front_clearance(self, half_width=0.28):
+        """Nearest obstacle ahead, measured in the base frame.
+
+        The front laser is mounted on a corner - 0.275 m forward, 0.183 m to
+        the side, yawed 45 degrees and rolled 180 - so rays near the scan's own
+        zero angle point diagonally, nowhere near the direction the robot
+        drives. Reading them as "straight ahead" made the reported clearance
+        disagree with the measured distance to the shelf by about 0.3 m, which
+        in turn made the base stop far short of where the arm could reach.
+
+        Each ray is placed in base_link instead, and only those crossing the
+        robot's own width count.
+        """
+        scan = self._front_scan
+        placement = self._laser_placement()
+        if scan is None or not scan.ranges or placement is None:
             return float('inf')
-        half = math.radians(half_angle_deg)
+        (ox, oy, _oz), q = placement
+
         best = float('inf')
         for i, r in enumerate(scan.ranges):
             if not math.isfinite(r) or r <= scan.range_min:
                 continue
             angle = scan.angle_min + i * scan.angle_increment
-            if -half <= angle <= half:
-                best = min(best, r)
+            bx, by, _bz = self._rotate(q, (r * math.cos(angle), r * math.sin(angle), 0.0))
+            bx += ox
+            by += oy
+            if bx > 0.0 and abs(by) <= half_width:
+                best = min(best, bx)
         return best
 
     def _on_approach_pose(self, pose: PoseStamped):
@@ -208,12 +260,17 @@ class NavigationNode(Node):
         # is actually in front of the target column. Driving the pair as one
         # vector meant the standoff cut the sideways correction short and the
         # robot stopped a fifth of a metre off the column.
+        # The odometry goal decides when to stop; the laser is a safety floor
+        # underneath it. Closing on the laser reading instead was tried and is
+        # wrong here: the shelf stops the base at about 0.7 m, so a laser
+        # target below that is never reached and the robot just pushes forward
+        # until something physically stops it.
         forward_done = forward_blocked or dx <= self.goal_tolerance
         lateral_done = abs(dy) <= self.goal_tolerance
         if forward_done and lateral_done:
             self.get_logger().info(
-                f'[NODE 2 NAV] In position: {dx:.2f} m ahead, {dy:+.2f} m across, '
-                f'shelf at {clearance:.2f} m.'
+                f'[NODE 2 NAV] In position: shelf at {clearance:.2f} m, '
+                f'{dy:+.2f} m across, {dx:+.2f} m from the odometry goal.'
             )
             self._finish('REACHED_SHELF')
             return

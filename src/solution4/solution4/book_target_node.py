@@ -184,6 +184,10 @@ class BookTargetNode(Node):
         # a trial parked with the book at 1.76 m and no IK solution existed.
         # This is deliberately shorter than the LiDAR stop distance in node 2,
         # so the LiDAR is what actually halts the approach.
+        # Stand-off is measured to the marker plate, which sits flush with the
+        # shelf edge, while the books are 0.145 m further in. In practice the
+        # shelf itself stops the base at about 0.7 m whatever this says, so it
+        # mainly governs how firmly the robot commits to closing the gap.
         self.SHELF_APPROACH_STANDOFF_M = 0.35
         # Where the identified column stands, in the base frame. Set once
         # the column is recognised and used to aim the approach pose so the
