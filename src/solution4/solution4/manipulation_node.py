@@ -86,10 +86,26 @@ TORSO_FOR_GRASP = 0.32
 # arms are mirrored, so one set of joint values cannot serve both.
 ARM_CLEAR_LEFT = [0.0, -2.40, 0.0, -2.30, 0.0, 0.0, 0.0]
 ARM_CLEAR_RIGHT = [-2.50, 1.10, 0.0, -2.40, 0.0, 0.0, 0.0]
+# Parked at the shelf, both arms swing through straight ahead on the way to the
+# clear pose and stall against the shelf (left shoulder stopped at +0.73 against
+# -2.40), where they then hide the lower rows. So back away first.
+ARM_CLEAR_BACKOFF = 0.35
+ARM_CLEAR_TOLERANCE = 0.15      # rad, on the two joints that swing furthest
 # Pad gap 56 mm at 0.065 against a 2 cm spine. The organisers' clamp on the
 # public gripper topic rejects anything outside [0.00, 0.069].
 GRIPPER_OPEN = 0.065
-GRIPPER_CLOSED = 0.0
+# Commanding the gripper fully closed drives the finger linkage straight through
+# the book: the fingertips are mimic joints driven kinematically, with no force
+# limit (the organisers' issue #2). Their workaround is to close under position
+# control and keep publishing a position just inside the spine. The pad gap is
+# 5 mm at 0.0 and 37.5 mm at 0.04, so a 2 cm spine is touched at about 0.0185.
+GRIPPER_HOLD = 0.012            # hold here if no contact is sensed on the way
+GRIPPER_HOLD_MIN = 0.004
+GRIPPER_CLOSE_STEP = 0.005
+GRIPPER_CONTACT_MAX = 0.030     # the spine cannot be touched at a wider opening
+GRIPPER_CONTACT_EFFORT = 0.5    # rise in finger effort taken as contact
+GRIPPER_SQUEEZE = 0.006         # how far past first contact to hold
+GRIPPER_HOLD_PERIOD = 0.5       # s between re-published hold commands
 PREGRASP_BACKOFF = 0.16         # m behind the book
 PREGRASP_MIN_X = 0.45           # nearer than this the elbow cannot fold
 GRASP_TARGET_X = 0.62           # book here: pre-grasp and grasp both reachable
@@ -202,6 +218,7 @@ class ManipulationNode(Node):
         self.row: Optional[int] = None
         self.last_size = (0.0, 0.0)
         self.kin: Any = None
+        self.hold_position: Optional[float] = None
 
         self.create_subscription(String, '/robot_description', self._on_urdf, latched)
         self.create_subscription(JointState, '/joint_states', self._on_joints, 10)
@@ -237,6 +254,8 @@ class ManipulationNode(Node):
 
         self.tf_buffer = tf2_ros.Buffer()
         self.tf_listener = tf2_ros.TransformListener(self.tf_buffer, self)
+        # Re-publishes the hold position while a book is held; every wait spins it.
+        self.create_timer(GRIPPER_HOLD_PERIOD, self._hold_gripper)
 
     # ------------------------------------------------------------------
     # Plumbing
@@ -296,6 +315,48 @@ class ManipulationNode(Node):
 
     def gripper(self, opening, seconds=2):
         self.send(self.grip, ['gripper_left_finger_joint'], [opening], seconds)
+
+    def effort(self, name):
+        if self.joints is None or len(self.joints.effort) != len(self.joints.name):
+            return float('nan')
+        return dict(zip(self.joints.name, self.joints.effort)).get(name, float('nan'))
+
+    def _hold_gripper(self):
+        if self.hold_position is not None:
+            self.gripper(self.hold_position, seconds=1)
+
+    def close_on_book(self):
+        """Close onto the spine and keep commanding a position just inside it.
+
+        The gripper steps closed under position control. Once the opening is
+        narrow enough to touch the spine, a rise in finger effort is taken as
+        contact and the hold position is set a little past it; without such a
+        signal it holds at GRIPPER_HOLD. The hold is then re-published on a
+        timer until release(), so the finger drive never pushes through.
+        """
+        joint = 'gripper_left_finger_joint'
+        baseline = self.effort(joint)
+        target = GRIPPER_HOLD
+        opening = GRIPPER_OPEN
+        while opening > GRIPPER_HOLD + 1e-6:
+            opening = max(GRIPPER_HOLD, opening - GRIPPER_CLOSE_STEP)
+            self.gripper(opening, seconds=1)
+            self.wait(1.5)
+            rise = self.effort(joint) - baseline
+            self.log(f'Gripper {opening:.3f}: effort {self.effort(joint):+.3f} ({rise:+.3f}).')
+            if opening <= GRIPPER_CONTACT_MAX and abs(rise) > GRIPPER_CONTACT_EFFORT:
+                target = max(GRIPPER_HOLD_MIN, opening - GRIPPER_SQUEEZE)
+                break
+        self.hold_position = target
+        self.gripper(target, seconds=1)
+        self.wait(3.0)
+        self.log(f'[NODE 3 GRASP] Holding the gripper at {target:.3f}.')
+
+    def release(self):
+        """Stop holding and open the gripper."""
+        self.hold_position = None
+        self.gripper(GRIPPER_OPEN)
+        self.wait(4.0)
 
     def grasp_point(self):
         t = self.tf_buffer.lookup_transform(ROOT_LINK, GRASP_LINK, Time()).transform
@@ -362,12 +423,36 @@ class ManipulationNode(Node):
                                  torso_position=self.pos('torso_lift_joint'))
         self.log(f"Torso at {self.pos('torso_lift_joint'):.3f} (wanted {target:.2f}).")
 
-    def clear_arms(self, seconds=10):
-        """Swing both arms down and out of the camera's view."""
-        for side, pub, q in (('left', self.arm, ARM_CLEAR_LEFT),
-                             ('right', self.arm_right, ARM_CLEAR_RIGHT)):
-            self.send(pub, [f'arm_{side}_{i}_joint' for i in range(1, 8)], q, seconds)
-        self.wait(seconds + 5)
+    def arms_clear(self):
+        return (abs(self.pos('arm_left_2_joint') - ARM_CLEAR_LEFT[1]) <= ARM_CLEAR_TOLERANCE
+                and abs(self.pos('arm_right_1_joint') - ARM_CLEAR_RIGHT[0])
+                <= ARM_CLEAR_TOLERANCE)
+
+    def clear_arms(self, seconds=10, backoff=ARM_CLEAR_BACKOFF):
+        """Swing both arms down and out of the camera's view, away from the shelf.
+
+        The base backs off first so the arms do not sweep into the shelf, and
+        returns the same distance afterwards. Returns whether the arms arrived.
+        """
+        if self.arms_clear():
+            return True
+        if backoff:
+            self.drive_forward(-backoff, speed=0.1)
+        for _ in range(2):
+            for side, pub, q in (('left', self.arm, ARM_CLEAR_LEFT),
+                                 ('right', self.arm_right, ARM_CLEAR_RIGHT)):
+                self.send(pub, [f'arm_{side}_{i}_joint' for i in range(1, 8)], q, seconds)
+            self.wait(seconds + 5)
+            if self.arms_clear():
+                break
+        cleared = self.arms_clear()
+        if not cleared:
+            self.get_logger().warn(
+                f"Arms not clear: left shoulder {self.pos('arm_left_2_joint'):+.2f}, "
+                f"right shoulder {self.pos('arm_right_1_joint'):+.2f}.")
+        if backoff:
+            self.drive_forward(backoff, speed=0.1)
+        return cleared
 
     def reach(self, x, y, z, seconds=8, settle=12):
         """Put the grasp point at (x, y, z) in base_link, verifying the result.
@@ -846,8 +931,11 @@ class ManipulationNode(Node):
             again = self.find_row(row)
             if again is not None:
                 bx, by, bz = again[1].point.x, again[1].point.y, again[1].point.z
-        self.log(f'[NODE 3 GRASP] Grasping at ({bx:.3f}, {by:+.3f}, {bz:.3f}).')
+        return self.pick(bx, by, bz)
 
+    def pick(self, bx, by, bz):
+        """Reach the book at (bx, by, bz) in base_link, close on it, lift and retract."""
+        self.log(f'[NODE 3 GRASP] Grasping at ({bx:.3f}, {by:+.3f}, {bz:.3f}).')
         # base_link coordinates do not move with the torso, so they survive this.
         if abs(self.pos('torso_lift_joint') - TORSO_FOR_GRASP) > 0.01:
             self.ramp_torso(TORSO_FOR_GRASP)
@@ -859,8 +947,7 @@ class ManipulationNode(Node):
             self.get_logger().error('[NODE 3 GRASP] Could not reach the pre-grasp pose.')
             return False
         self.reach(bx + GRASP_DEPTH, by, bz, seconds=5, settle=9)
-        self.gripper(GRIPPER_CLOSED, seconds=3)
-        self.wait(6.0)
+        self.close_on_book()
         self.reach(bx + GRASP_DEPTH, by, bz + LIFT_HEIGHT, seconds=4, settle=8)
         self.reach(pre_x, by, bz + LIFT_HEIGHT, seconds=6, settle=10)
         self.log('[NODE 3 GRASP] Closed, lifted and retracted.')
@@ -898,8 +985,7 @@ class ManipulationNode(Node):
         self.reach(rel_x, bin_y, above_z)
         self.reach(rel_x, bin_y, 0.5 * (above_z + release_z), seconds=4, settle=8)
         self.reach(rel_x, bin_y, release_z, seconds=4, settle=8)
-        self.gripper(GRIPPER_OPEN)
-        self.wait(4.0)
+        self.release()
         self.log('[NODE 3 DELIVER] Released over the bin.')
         # Lift clear and tuck in before anything else moves: moving the base
         # with the arm over the bin once dragged the bin 0.34 m.
