@@ -138,7 +138,9 @@ ALIGN_BEARING_MAX_DEG = 20.0
 ALIGN_LATERAL_TOL = 0.03
 ALIGN_RANGE_TOL = 0.03
 ALIGN_PASSES = 6
-BIN_TILTS = (-0.55, -0.35, -0.75)
+# Steep tilts first: at -0.35 the near rim can fall out of the frame, and the
+# near edge then measured 0.11 m too far (probe_bin.py against ground truth).
+BIN_TILTS = (-0.55, -0.75, -0.35)
 BIN_PANS = (0.0, 0.5, -0.5, 1.0, -1.0)
 RED = COLOUR_RANGES['red']
 BIN_LENGTH = 0.56
