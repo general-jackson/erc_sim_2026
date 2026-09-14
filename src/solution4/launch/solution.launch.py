@@ -34,9 +34,22 @@ def generate_launch_description():
         output='screen'
     )
 
+    # Grasps the book once node 2 reports REACHED_SHELF, then delivers it to
+    # the collection bin.
+    node3 = Node(
+        package='solution4',
+        executable='manipulation_node',
+        name='node3_manipulation',
+        output='screen',
+        parameters=[{
+            'book_colour': LaunchConfiguration('book_colour'),
+        }]
+    )
+
     return LaunchDescription([
         shelf_column_arg,
         book_colour_arg,
         node1,
-        node2
+        node2,
+        node3
     ])

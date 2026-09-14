@@ -36,6 +36,7 @@ setup(
         'console_scripts': [
             'book_target_node = solution4.book_target_node:main',
             'nav_node = solution4.nav_node:main',
+            'manipulation_node = solution4.manipulation_node:main',
             'collect_digits = solution4.collect_digits:main',
         ],
     },
