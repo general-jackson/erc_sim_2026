@@ -69,6 +69,7 @@ HEAD_2_LOWER, HEAD_2_UPPER = -1.0472, 0.34907
 HEAD_1_LIMIT = 1.2
 HEAD_TILTS = (0.0, -0.30, -0.60, -0.90, -1.04, 0.20)
 BOOK_MIN_LONG_SIDE = 0.08       # m; drops specks
+BOOK_FACE_PERCENTILE = 15       # depth percentile over the book's pixels = its near face
 ARM_LINKS = ('gripper_right_grasping_link', 'gripper_right_base_link',
              'arm_right_tool_link', 'gripper_left_grasping_link',
              'gripper_left_base_link')
@@ -533,17 +534,28 @@ class ManipulationNode(Node):
         return [cv2.boundingRect(c) for c in contours]
 
     def deproject(self, box):
-        """Return the centre of a box as a PointStamped in base_link, or None."""
-        depth = self.bridge.imgmsg_to_cv2(self.depth, 'passthrough')
+        """Return the book's near face under a box as a PointStamped in base_link, or None.
+
+        Depth is a low percentile over the box's pixels of the book's colour,
+        not the median at its centre. Seen even slightly from the side, the box
+        also covers the book's side face, which reads up to 16 cm deeper; a
+        grasp aimed there pushed the book 7 cm into the shelf.
+        """
+        depth = self.bridge.imgmsg_to_cv2(self.depth, 'passthrough').astype(np.float32)
+        frame = self.bridge.imgmsg_to_cv2(self.colour, 'bgr8')
         x, y, w, h = box
         u, v = x + w // 2, y + h // 2
         dh, dw = depth.shape[:2]
-        patch = depth[max(0, v - 3):min(dh, v + 4),
-                      max(0, u - 3):min(dw, u + 4)].astype(np.float32)
-        good = patch[np.isfinite(patch) & (patch > 0.05)]
+        x0, x1, y0, y1 = max(0, x), min(dw, x + w), max(0, y), min(dh, y + h)
+        hsv = cv2.cvtColor(frame[y0:y1, x0:x1], cv2.COLOR_BGR2HSV)
+        mask = np.zeros(hsv.shape[:2], np.uint8)
+        for lo, hi in COLOUR_RANGES[self.book_colour]:
+            mask |= cv2.inRange(hsv, np.array(lo), np.array(hi))
+        region = depth[y0:y1, x0:x1]
+        good = region[(mask > 0) & np.isfinite(region) & (region > 0.05)]
         if good.size < 4:
             return None
-        z = float(np.median(good))
+        z = float(np.percentile(good, BOOK_FACE_PERCENTILE))
         fx, fy, cx, cy = self.intrinsics
         point = PointStamped()
         point.header.frame_id = self.depth.header.frame_id
@@ -714,10 +726,18 @@ class ManipulationNode(Node):
         width = float(np.percentile(across, 95) - np.percentile(across, 5))
         if width < 0.15:
             return None
+        # Centre line from the rim's two outer edges. The median of every red
+        # point leans towards whichever inner wall the camera sees more of, and
+        # read 0.14 m off the true centre line.
+        if len(top) > 50:
+            rim_across = top @ v
+            centre = 0.5 * float(np.percentile(rim_across, 3) + np.percentile(rim_across, 97))
+        else:
+            centre = float(np.median(across))
         result = {
             'axis': axis, 'reliable': reliable, 'rim_z': rim_z,
             'near': float(np.percentile(along, 5)),
-            'centre': float(np.median(across)),
+            'centre': centre,
             'bearing': math.atan2(float(np.median(pts[:, 1])), float(np.median(pts[:, 0]))),
         }
         trust = 'trusted' if reliable else 'not trusted'
