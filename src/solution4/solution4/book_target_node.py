@@ -2,34 +2,33 @@ from collections import deque
 import datetime
 import math
 import os
+from typing import Any
 
+from ament_index_python.packages import get_package_share_directory
+from builtin_interfaces.msg import Time
 import cv2
 from cv_bridge import CvBridge
+from geometry_msgs.msg import PointStamped, PoseStamped, Twist
 import message_filters
 import numpy as np
-
 import rclpy
+from rclpy.duration import Duration as RclpyDuration
 from rclpy.node import Node
 from rclpy.parameter import Parameter
 from rclpy.qos import (
-    QoSProfile,
-    QoSReliabilityPolicy,
+    DurabilityPolicy,
     QoSDurabilityPolicy,
     QoSHistoryPolicy,
+    QoSProfile,
+    QoSReliabilityPolicy,
     ReliabilityPolicy,
-    DurabilityPolicy
 )
-
-from geometry_msgs.msg import PointStamped, PoseStamped, Twist
-from sensor_msgs.msg import Image, LaserScan, Imu, CameraInfo
-from std_msgs.msg import Int32
-from trajectory_msgs.msg import JointTrajectory, JointTrajectoryPoint
-from builtin_interfaces.msg import Time
-from ament_index_python.packages import get_package_share_directory
 from rclpy.time import Time as RclpyTime
-from rclpy.duration import Duration as RclpyDuration
-import tf2_ros
+from sensor_msgs.msg import CameraInfo, Image, Imu, LaserScan
+from std_msgs.msg import Int32
 import tf2_geometry_msgs  # noqa: F401  - registers PointStamped with the TF buffer
+import tf2_ros
+from trajectory_msgs.msg import JointTrajectory, JointTrajectoryPoint
 
 
 class BookTargetNode(Node):
@@ -51,7 +50,7 @@ class BookTargetNode(Node):
         raw_colour = self.get_parameter('book_colour').value
 
         if raw_shelf is None or raw_colour is None:
-            self.get_logger().error("[INIT] Missing required launch parameters!")
+            self.get_logger().error('[INIT] Missing required launch parameters!')
             return
 
         self.shelf_column_number = str(raw_shelf)
@@ -142,13 +141,14 @@ class BookTargetNode(Node):
         self._last_digit_confidence = 0.0
 
         # 2. ONNX Model Initialization
+        self.net: Any = None
         try:
             package_share = get_package_share_directory('solution4')
             model_path = os.path.join(package_share, 'models', 'gazebo_digit_model.onnx')
             self.net = cv2.dnn.readNetFromONNX(model_path) if os.path.exists(model_path) else None
         except Exception as e:
             self.net = None
-            self.get_logger().error(f"[INIT] Failed loading ONNX model: {e}")
+            self.get_logger().error(f'[INIT] Failed loading ONNX model: {e}')
 
         # State Variables & Tracking
         self.arms_ready = False
@@ -210,7 +210,7 @@ class BookTargetNode(Node):
         try:
             os.makedirs(self.images_dir, exist_ok=True)
         except OSError as e:
-            self.get_logger().error(f"[INIT] Cannot create {self.images_dir}: {e}")
+            self.get_logger().error(f'[INIT] Cannot create {self.images_dir}: {e}')
 
         # OpenCV Resources
         self.bridge = CvBridge()
@@ -223,13 +223,17 @@ class BookTargetNode(Node):
 
         # Publishers
         latched_qos = QoSProfile(
-            depth=1, reliability=ReliabilityPolicy.RELIABLE, durability=DurabilityPolicy.TRANSIENT_LOCAL
+            depth=1, reliability=ReliabilityPolicy.RELIABLE,
+            durability=DurabilityPolicy.TRANSIENT_LOCAL
         )
         self.point_pub = self.create_publisher(PointStamped, '/detected_book_pose', 10)
-        self.arm_left_pub = self.create_publisher(JointTrajectory, '/arm_left_controller/joint_trajectory', 10)
-        self.arm_right_pub = self.create_publisher(JointTrajectory, '/arm_right_controller/joint_trajectory', 10)
+        self.arm_left_pub = self.create_publisher(
+            JointTrajectory, '/arm_left_controller/joint_trajectory', 10)
+        self.arm_right_pub = self.create_publisher(
+            JointTrajectory, '/arm_right_controller/joint_trajectory', 10)
         self.cmd_vel_pub = self.create_publisher(Twist, '/cmd_vel', 10)
-        self.shelf_approach_pub = self.create_publisher(PoseStamped, '/erc/shelf_approach_pose', latched_qos)
+        self.shelf_approach_pub = self.create_publisher(
+            PoseStamped, '/erc/shelf_approach_pose', latched_qos)
 
         # Competition scoring topics (Phase 1 rubric, Table 1: +1 point each).
         # Latched so a monitor that subscribes after we publish still receives
@@ -249,10 +253,12 @@ class BookTargetNode(Node):
             depth=10,
         )
         self.colour_sub = message_filters.Subscriber(
-            self, Image, '/head_front_camera/head_front_camera/color/image_raw', qos_profile=camera_qos
+            self, Image, '/head_front_camera/head_front_camera/color/image_raw',
+            qos_profile=camera_qos
         )
         self.depth_sub = message_filters.Subscriber(
-            self, Image, '/head_front_camera/head_front_camera/depth/image_rect_raw', qos_profile=camera_qos
+            self, Image, '/head_front_camera/head_front_camera/depth/image_rect_raw',
+            qos_profile=camera_qos
         )
         self.camera_sync = message_filters.ApproximateTimeSynchronizer(
             [self.colour_sub, self.depth_sub], queue_size=10, slop=0.1
@@ -277,8 +283,8 @@ class BookTargetNode(Node):
             history=QoSHistoryPolicy.KEEP_LAST,
             depth=10,
         )
-        self.front_scan_history = deque(maxlen=5)
-        self.rear_scan_history = deque(maxlen=5)
+        self.front_scan_history: deque = deque(maxlen=5)
+        self.rear_scan_history: deque = deque(maxlen=5)
         self.create_subscription(LaserScan, '/scan_front_raw', self._lidar_callback, lidar_qos)
         self.create_subscription(LaserScan, '/scan_rear_raw', self._rear_lidar_callback, lidar_qos)
         self.create_subscription(Imu, '/base_imu', self._imu_callback, lidar_qos)
@@ -315,7 +321,7 @@ class BookTargetNode(Node):
         self.arm_left_pub.publish(msg_left)
         self.arm_right_pub.publish(msg_right)
         self.arms_ready = True
-        self.get_logger().info("[STEP 1] Both arms command sent simultaneously.")
+        self.get_logger().info('[STEP 1] Both arms command sent simultaneously.')
 
         self.vision_timer = self.create_timer(2.0, self._start_rgbd_callback)
 
@@ -347,7 +353,7 @@ class BookTargetNode(Node):
         # STEP 2 & 3: CHECK RED BOX VIA RGB -> LIDAR FALLBACK -> DETERMINE MOTION
         # ---------------------------------------------------------------------
         if self.table_position == 'unknown':
-             # Allow sensors to stabilize
+            # Allow sensors to stabilize
 
             if self._detect_red_box_rgb(frame):
                 self.table_position = 'front'
@@ -407,8 +413,8 @@ class BookTargetNode(Node):
         if depth_jump and self.depth_change_count < 2:
             self.depth_change_count += 1
             self.get_logger().info(
-                f"[STEP 4] Depth jump #{self.depth_change_count} detected "
-                "(>= 1.3m)."
+                f'[STEP 4] Depth jump #{self.depth_change_count} detected '
+                '(>= 1.3m).'
             )
 
             if self.depth_change_count == 1:
@@ -446,9 +452,9 @@ class BookTargetNode(Node):
             if col_box is not None and self._digit_streak < self.digit_confirm_frames:
                 self.get_logger().info(
                     f"[STEP 5] Candidate digit '{self.shelf_column_number}' "
-                    f"(confidence {self._last_digit_confidence:.2f}), "
-                    f"{self._digit_streak}/{self.digit_confirm_frames} frames - "
-                    "keep looking.",
+                    f'(confidence {self._last_digit_confidence:.2f}), '
+                    f'{self._digit_streak}/{self.digit_confirm_frames} frames - '
+                    'keep looking.',
                     throttle_duration_sec=1.0,
                 )
                 col_box = None
@@ -492,7 +498,8 @@ class BookTargetNode(Node):
                 # Publish Book Pixel Target
                 pt = PointStamped()
                 pt.header = colour_msg.header
-                pt.point.x, pt.point.y, pt.point.z = float(book_center[0]), float(book_center[1]), 0.0
+                pt.point.x, pt.point.y, pt.point.z = (
+                    float(book_center[0]), float(book_center[1]), 0.0)
                 self.point_pub.publish(pt)
 
                 # Publish Shelf Approach Pose for Nav2 / Node 2
@@ -501,7 +508,8 @@ class BookTargetNode(Node):
                 # Terminal Log Image Paths
                 self._save_final_annotated_image(frame, self.target_column_box, target_box, row)
                 self.processing_complete = True
-                self.get_logger().info("[STEP 7] Target book identified and pose data published. Task Complete.")
+                self.get_logger().info(
+                    '[STEP 7] Target book identified and pose data published. Task Complete.')
 
     @staticmethod
     def _default_images_dir():
@@ -542,7 +550,7 @@ class BookTargetNode(Node):
         self.column_id_pub.publish(Int32(data=value))
         self.column_id_published = True
         self.get_logger().info(
-            f"[SCORE] Published {value} to /erc/shelf_column_identification"
+            f'[SCORE] Published {value} to /erc/shelf_column_identification'
         )
 
     def _publish_row_identification(self, row):
@@ -552,7 +560,7 @@ class BookTargetNode(Node):
         self.row_id_pub.publish(Int32(data=int(row)))
         self.row_id_published = True
         self.get_logger().info(
-            f"[SCORE] Published {row} to /erc/shelf_row_identification"
+            f'[SCORE] Published {row} to /erc/shelf_row_identification'
         )
 
     # =========================================================================
@@ -563,8 +571,8 @@ class BookTargetNode(Node):
             return False
 
         hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
-        mask = cv2.inRange(hsv, np.array([0, 120, 70]), np.array([10, 255, 255])) | \
-               cv2.inRange(hsv, np.array([170, 120, 70]), np.array([180, 255, 255]))
+        mask = (cv2.inRange(hsv, np.array([0, 120, 70]), np.array([10, 255, 255]))
+                | cv2.inRange(hsv, np.array([170, 120, 70]), np.array([180, 255, 255])))
         mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, np.ones((5, 5), np.uint8))
         mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, np.ones((9, 9), np.uint8))
         contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
@@ -589,8 +597,8 @@ class BookTargetNode(Node):
         # Allow sensors to stabilize
         if not self.front_scan_history and not self.rear_scan_history:
             self.get_logger().warn(
-            '[STEP 3] LiDAR scan history is empty. Waiting for data...'
-              )
+                '[STEP 3] LiDAR scan history is empty. Waiting for data...'
+            )
             return 'none'
 
         front_left = self._average_sector_min(130.0, 5.0, self.front_scan_history)
@@ -598,7 +606,6 @@ class BookTargetNode(Node):
 
         rear_left = self._average_sector_min(5.0, 130.0, self.rear_scan_history)
         rear_right = self._average_sector_min(-130.0, -5.0, self.rear_scan_history)
-
 
         left_dist = min(front_left, rear_left)
         right_dist = min(front_right, rear_right)
@@ -622,13 +629,14 @@ class BookTargetNode(Node):
             throttle_duration_sec=2.0,
         )
         if valid_candidates:
-            return min(valid_candidates, key=valid_candidates.get)
+            return min(valid_candidates, key=lambda side: valid_candidates[side])
         return 'none'
 
     def _check_depth_patch_change(self, depth_msg):
         depth_img = self.bridge.imgmsg_to_cv2(depth_msg, desired_encoding='passthrough')
         h, w = depth_img.shape[:2]
-        patch = depth_img[max(0, h // 2 - 10): min(h, h // 2 + 10), max(0, w - 20): w].astype(np.float32)
+        patch = depth_img[max(0, h // 2 - 10): min(h, h // 2 + 10),
+                          max(0, w - 20): w].astype(np.float32)
         valid = patch[np.isfinite(patch) & (patch > 0)]
         if valid.size == 0:
             return False
@@ -665,7 +673,7 @@ class BookTargetNode(Node):
             yield (x, y, w, h), (labels == i)
 
     def _plate_grey(self, gray, glyph):
-        """The plate's own grey, read from a ring just clear of the glyph.
+        """Return the plate's own grey, read from a ring just clear of the glyph.
 
         Measured every time rather than assumed, because how bright a plate
         renders depends on where the robot is standing. Sampled a couple of
@@ -840,7 +848,8 @@ class BookTargetNode(Node):
         scale = 20.0 / max(h, w)
         nw, nh = max(1, int(w * scale)), max(1, int(h * scale))
         canvas = np.zeros((28, 28), dtype=np.uint8)
-        canvas[(28 - nh) // 2: (28 - nh) // 2 + nh, (28 - nw) // 2: (28 - nw) // 2 + nw] = cv2.resize(glyph, (nw, nh))
+        canvas[(28 - nh) // 2: (28 - nh) // 2 + nh,
+               (28 - nw) // 2: (28 - nw) // 2 + nw] = cv2.resize(glyph, (nw, nh))
         blob = cv2.dnn.blobFromImage(canvas, 1.0 / 255.0, (28, 28))
         self.net.setInput(blob)
 
@@ -908,8 +917,8 @@ class BookTargetNode(Node):
         ordered = sorted(books.items(), key=lambda item: item[1][1])
         if len(ordered) < 4:
             self.get_logger().warn(
-                f"[SCORE] Only {len(ordered)} of 4 books visible in the column - "
-                "the row index is an estimate."
+                f'[SCORE] Only {len(ordered)} of 4 books visible in the column - '
+                'the row index is an estimate.'
             )
         for index, (name, _) in enumerate(ordered):
             if name == colour:
@@ -1121,7 +1130,7 @@ class BookTargetNode(Node):
         """
         sim_seconds = self.get_clock().now().nanoseconds / 1e9
         wall = datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-        label = f"{wall}   sim_t={sim_seconds:.3f}s"
+        label = f'{wall}   sim_t={sim_seconds:.3f}s'
 
         height, width = img.shape[:2]
         cv2.rectangle(img, (0, height - 26), (width, height), (0, 0, 0), -1)
@@ -1133,10 +1142,10 @@ class BookTargetNode(Node):
 
     def _write_image(self, img, prefix):
         filename = os.path.join(
-            self.images_dir, f"{prefix}_{self.get_clock().now().nanoseconds}.png"
+            self.images_dir, f'{prefix}_{self.get_clock().now().nanoseconds}.png'
         )
         if not cv2.imwrite(filename, img):
-            self.get_logger().error(f"[IMAGE] Failed to write {filename}")
+            self.get_logger().error(f'[IMAGE] Failed to write {filename}')
             return None
         return os.path.abspath(filename)
 
@@ -1146,7 +1155,7 @@ class BookTargetNode(Node):
         img = frame.copy()
         cv2.rectangle(img, (x, y), (x + w, y + h), (0, 255, 0), 2)
         cv2.putText(
-            img, f"column {self.shelf_column_number}", (x, max(14, y - 8)),
+            img, f'column {self.shelf_column_number}', (x, max(14, y - 8)),
             cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2, cv2.LINE_AA
         )
         self._stamp_image(img)
@@ -1154,7 +1163,7 @@ class BookTargetNode(Node):
         self.image1_path = self._write_image(img, 'detected_column')
         if self.image1_path:
             self.column_image_saved = True
-            self.get_logger().info(f"[STEP 5] Column image saved: {self.image1_path}")
+            self.get_logger().info(f'[STEP 5] Column image saved: {self.image1_path}')
 
     def _save_final_annotated_image(self, frame, col_box, book_box, row=None):
         """Bounding box around the target book (+2 points)."""
@@ -1165,9 +1174,9 @@ class BookTargetNode(Node):
 
         bx, by, bw, bh = book_box
         cv2.rectangle(img, (bx, by), (bx + bw, by + bh), (0, 0, 255), 2)
-        caption = f"{self.book_colour} book"
+        caption = f'{self.book_colour} book'
         if row is not None:
-            caption += f" (row {row})"
+            caption += f' (row {row})'
         cv2.putText(
             img, caption, (bx, max(14, by - 8)),
             cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 255), 2, cv2.LINE_AA
@@ -1176,7 +1185,7 @@ class BookTargetNode(Node):
 
         self.image2_path = self._write_image(img, 'detected_book')
         self.get_logger().info(
-            f"[LOG] Image 1: {self.image1_path} | Image 2: {self.image2_path}"
+            f'[LOG] Image 1: {self.image1_path} | Image 2: {self.image2_path}'
         )
 
 

@@ -42,13 +42,12 @@ from rclpy.parameter import Parameter
 from rclpy.qos import QoSDurabilityPolicy, QoSHistoryPolicy, QoSProfile, QoSReliabilityPolicy
 from rclpy.time import Time
 from sensor_msgs.msg import CameraInfo, Image, JointState, LaserScan
+from solution4.arm_kinematics import ArmKinematics, GRASP_LINK, ROOT_LINK
+from solution4.camera_intrinsics import intrinsics_from_urdf
 from std_msgs.msg import Int32, String
 import tf2_geometry_msgs  # noqa: F401  - registers PointStamped with the TF buffer
 import tf2_ros
 from trajectory_msgs.msg import JointTrajectory, JointTrajectoryPoint
-
-from solution4.arm_kinematics import ArmKinematics, GRASP_LINK, ROOT_LINK
-from solution4.camera_intrinsics import intrinsics_from_urdf
 
 
 # --- the shelf and the books ------------------------------------------------

@@ -20,19 +20,17 @@ directly and treats the front LiDAR as the authority on when to stop.
 
 import math
 
+from geometry_msgs.msg import PoseStamped, Twist
 import rclpy
+from rclpy.duration import Duration
 from rclpy.node import Node
 from rclpy.parameter import Parameter
-from rclpy.duration import Duration
-from rclpy.qos import QoSProfile, QoSReliabilityPolicy, QoSDurabilityPolicy, QoSHistoryPolicy
+from rclpy.qos import QoSDurabilityPolicy, QoSHistoryPolicy, QoSProfile, QoSReliabilityPolicy
 from rclpy.time import Time
-
-from geometry_msgs.msg import PoseStamped, Twist
 from sensor_msgs.msg import LaserScan
 from std_msgs.msg import String
-
-import tf2_ros
 import tf2_geometry_msgs  # noqa: F401  - registers PoseStamped with the TF buffer
+import tf2_ros
 
 
 class NavigationNode(Node):
@@ -185,13 +183,15 @@ class NavigationNode(Node):
             f'frame={pose.header.frame_id}'
         )
         if self._goal is not None:
-            self.get_logger().warn('[NODE 2 BUSY] Navigation already active; ignoring repeat trigger.')
+            self.get_logger().warn(
+                '[NODE 2 BUSY] Navigation already active; ignoring repeat trigger.')
             self._publish_status('NAV_BUSY')
             return
 
         goal = self._to_goal_frame(pose)
         if goal is None:
-            self.get_logger().error('[NODE 2 ERROR] Could not anchor the goal; aborting navigation.')
+            self.get_logger().error(
+                '[NODE 2 ERROR] Could not anchor the goal; aborting navigation.')
             self._publish_status('NAV_FAILED')
             return
 
@@ -218,7 +218,8 @@ class NavigationNode(Node):
                 probe, self.goal_frame, timeout=Duration(seconds=3.0)
             )
         except Exception as exc:
-            self.get_logger().error(f'[NODE 2 TF] {pose.header.frame_id} -> {self.goal_frame} failed: {exc}')
+            self.get_logger().error(
+                f'[NODE 2 TF] {pose.header.frame_id} -> {self.goal_frame} failed: {exc}')
             return None
 
     # ------------------------------------------------------------------
@@ -296,6 +297,7 @@ class NavigationNode(Node):
 
     def _stamped_goal(self):
         probe = PoseStamped()
+        assert self._goal is not None, 'no active goal'
         probe.header.frame_id = self.goal_frame
         probe.header.stamp = Time().to_msg()
         probe.pose = self._goal.pose

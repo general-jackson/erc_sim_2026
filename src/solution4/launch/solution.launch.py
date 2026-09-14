@@ -3,13 +3,14 @@ from launch.actions import DeclareLaunchArgument
 from launch.substitutions import LaunchConfiguration
 from launch_ros.actions import Node
 
+
 def generate_launch_description():
     shelf_column_arg = DeclareLaunchArgument(
         'shelf_column_number',
         default_value='1',
         description='Target shelf column number'
     )
-    
+
     book_colour_arg = DeclareLaunchArgument(
         'book_colour',
         default_value='red',
