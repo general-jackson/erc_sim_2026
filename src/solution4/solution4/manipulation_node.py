@@ -99,7 +99,9 @@ GRIPPER_OPEN = 0.065
 # limit (the organisers' issue #2). Their workaround is to close under position
 # control and keep publishing a position just inside the spine. The pad gap is
 # 5 mm at 0.0 and 37.5 mm at 0.04, so a 2 cm spine is touched at about 0.0185.
-GRIPPER_HOLD = 0.012            # hold here if no contact is sensed on the way
+# Validated against ground truth: held at 0.016, a 2 cm book was lifted 3.9 cm
+# and pulled 16.7 cm off the shelf, and still hung there 1.5 minutes later.
+GRIPPER_HOLD = 0.016            # hold here if no contact is sensed on the way
 GRIPPER_HOLD_MIN = 0.004
 GRIPPER_CLOSE_STEP = 0.005
 GRIPPER_CONTACT_MAX = 0.030     # the spine cannot be touched at a wider opening
