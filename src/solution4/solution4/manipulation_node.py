@@ -101,12 +101,10 @@ GRIPPER_OPEN = 0.065
 # 5 mm at 0.0 and 37.5 mm at 0.04, so a 2 cm spine is touched at about 0.0185.
 # Validated against ground truth: held at 0.016, a 2 cm book was lifted 3.9 cm
 # and pulled 16.7 cm off the shelf, and still hung there 1.5 minutes later.
-GRIPPER_HOLD = 0.016            # hold here if no contact is sensed on the way
-GRIPPER_HOLD_MIN = 0.004
+# Tighter holds were not better: finger effort reads 0.000 throughout the close,
+# so there is no contact signal to stop on, and the position alone decides.
+GRIPPER_HOLD = 0.016
 GRIPPER_CLOSE_STEP = 0.005
-GRIPPER_CONTACT_MAX = 0.030     # the spine cannot be touched at a wider opening
-GRIPPER_CONTACT_EFFORT = 0.5    # rise in finger effort taken as contact
-GRIPPER_SQUEEZE = 0.006         # how far past first contact to hold
 GRIPPER_HOLD_PERIOD = 0.5       # s between re-published hold commands
 PREGRASP_BACKOFF = 0.16         # m behind the book
 PREGRASP_MIN_X = 0.45           # nearer than this the elbow cannot fold
@@ -318,11 +316,6 @@ class ManipulationNode(Node):
     def gripper(self, opening, seconds=2):
         self.send(self.grip, ['gripper_left_finger_joint'], [opening], seconds)
 
-    def effort(self, name):
-        if self.joints is None or len(self.joints.effort) != len(self.joints.name):
-            return float('nan')
-        return dict(zip(self.joints.name, self.joints.effort)).get(name, float('nan'))
-
     def _hold_gripper(self):
         if self.hold_position is not None:
             self.gripper(self.hold_position, seconds=1)
@@ -330,29 +323,18 @@ class ManipulationNode(Node):
     def close_on_book(self):
         """Close onto the spine and keep commanding a position just inside it.
 
-        The gripper steps closed under position control. Once the opening is
-        narrow enough to touch the spine, a rise in finger effort is taken as
-        contact and the hold position is set a little past it; without such a
-        signal it holds at GRIPPER_HOLD. The hold is then re-published on a
-        timer until release(), so the finger drive never pushes through.
+        The gripper steps closed under position control to GRIPPER_HOLD, and
+        that position is then re-published on a timer until release(), so the
+        finger drive never pushes through the book.
         """
-        joint = 'gripper_left_finger_joint'
-        baseline = self.effort(joint)
-        target = GRIPPER_HOLD
         opening = GRIPPER_OPEN
         while opening > GRIPPER_HOLD + 1e-6:
             opening = max(GRIPPER_HOLD, opening - GRIPPER_CLOSE_STEP)
             self.gripper(opening, seconds=1)
             self.wait(1.5)
-            rise = self.effort(joint) - baseline
-            self.log(f'Gripper {opening:.3f}: effort {self.effort(joint):+.3f} ({rise:+.3f}).')
-            if opening <= GRIPPER_CONTACT_MAX and abs(rise) > GRIPPER_CONTACT_EFFORT:
-                target = max(GRIPPER_HOLD_MIN, opening - GRIPPER_SQUEEZE)
-                break
-        self.hold_position = target
-        self.gripper(target, seconds=1)
+        self.hold_position = GRIPPER_HOLD
         self.wait(3.0)
-        self.log(f'[NODE 3 GRASP] Holding the gripper at {target:.3f}.')
+        self.log(f'[NODE 3 GRASP] Holding the gripper at {GRIPPER_HOLD:.3f}.')
 
     def release(self):
         """Stop holding and open the gripper."""
