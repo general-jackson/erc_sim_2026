@@ -42,7 +42,7 @@ from rclpy.parameter import Parameter
 from rclpy.qos import QoSDurabilityPolicy, QoSHistoryPolicy, QoSProfile, QoSReliabilityPolicy
 from rclpy.time import Time
 from sensor_msgs.msg import CameraInfo, Image, JointState, LaserScan
-from solution4.arm_kinematics import ArmKinematics, GRASP_LINK, ROOT_LINK
+from solution4.arm_kinematics import APPROACH_PITCHES_DEG, ArmKinematics, GRASP_LINK, ROOT_LINK
 from solution4.camera_intrinsics import intrinsics_from_urdf
 from std_msgs.msg import Int32, String
 import tf2_geometry_msgs  # noqa: F401  - registers PointStamped with the TF buffer
@@ -447,9 +447,10 @@ class ManipulationNode(Node):
         from the failed attempt, and differs towards something reachable.
         """
         pitch, arm = None, []
+        pitches = list(APPROACH_PITCHES_DEG)
         for attempt in range(REACH_ATTEMPTS):
             current = [self.pos(name) for name in self.kin.joint_names]
-            q, pitch = self.kin.solve(x, y, z, current=current)
+            q, pitch = self.kin.solve(x, y, z, pitches=pitches, current=current)
             if q is None:
                 self.log(f'No IK for ({x:.3f}, {y:+.3f}, {z:.3f}), attempt {attempt + 1}.')
                 continue
@@ -460,6 +461,10 @@ class ManipulationNode(Node):
             if not stuck:
                 break
             self.log(f"Attempt {attempt + 1}: {', '.join(stuck)} did not track.")
+            # A stalled joint is usually the arm meeting the shelf; the same
+            # wrist pitch would meet it again, so try the next one.
+            if pitch in pitches and len(pitches) > 1:
+                pitches.remove(pitch)
         if not arm:
             return False
         try:
@@ -964,7 +969,12 @@ class ManipulationNode(Node):
         if not self.reach(pre_x, by, bz):
             self.get_logger().error('[NODE 3 GRASP] Could not reach the pre-grasp pose.')
             return False
-        self.reach(bx + GRASP_DEPTH, by, bz, seconds=5, settle=9)
+        if not self.reach(bx + GRASP_DEPTH, by, bz, seconds=5, settle=9):
+            # Carrying on with an empty gripper once sent the robot to line up on
+            # a red book it took for the bin. Stop here instead.
+            self.get_logger().error('[NODE 3 GRASP] Book not reached; backing the arm out.')
+            self.reach(pre_x, by, bz)
+            return False
         self.close_on_book()
         self.reach(bx + GRASP_DEPTH, by, bz + LIFT_HEIGHT, seconds=4, settle=8)
         self.reach(pre_x, by, bz + LIFT_HEIGHT, seconds=6, settle=10)
