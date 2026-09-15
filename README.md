@@ -1,5 +1,35 @@
 # Emirates Robotics Competition 2026
 
+## Team RIT Vectors - Phase 1 solution
+
+Our solution is the ROS 2 package **solution4** (src/solution4). It is the only
+package we created; everything else in this repository is the organisers'
+environment, unmodified.
+
+Run it inside the provided Docker image, after the simulation is up:
+
+~~~bash
+ros2 launch erc_bringup simulation.launch.py
+ros2 launch solution4 solution.launch.py shelf_column_number:=2 book_colour:=red
+~~~
+
+- **Nodes:** node1_search (perception: column digit, target book, row),
+  node2_navigation (drive to the column), node3_manipulation (grasp, return to
+  the start zone, place the book in the bin). See
+  [src/solution4/README.md](src/solution4/README.md) for topics, parameters and
+  design notes.
+- **Annotated images** are written during the run to **src/erc_images/**,
+  stamped with the time. It sits under src/ because that is the part of the
+  repository the provided Docker setup mounts into the container.
+- **Dependencies** are listed in src/solution4/package.xml; beyond the image's
+  ROS packages the solution needs python3-pykdl (for arm inverse kinematics).
+- Scoring topics: /erc/shelf_column_identification and
+  /erc/shelf_row_identification (std_msgs/Int32). Progress is also published on
+  /erc/nav_status and /erc/manipulation_status.
+
+---
+
+
 Library Assistant Robot challenge: Autonomous book retrieval using a TIAGo Pro mobile manipulator.
 
 <img src="docs/assets/erc_3d_env.png" width="300"/> <img src="docs/assets/tiago_pro.png" width="200"/>
