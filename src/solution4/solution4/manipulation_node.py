@@ -425,7 +425,10 @@ class ManipulationNode(Node):
             for side, pub, q in (('left', self.arm, ARM_CLEAR_LEFT),
                                  ('right', self.arm_right, ARM_CLEAR_RIGHT)):
                 self.send(pub, [f'arm_{side}_{i}_joint' for i in range(1, 8)], q, seconds)
-            self.wait(seconds + 5)
+            # The right arm can take well over the trajectory time to arrive.
+            start = self.get_clock().now()
+            while self.elapsed(start) < seconds + 20 and not self.arms_clear():
+                self.wait(1.0)
             if self.arms_clear():
                 break
         cleared = self.arms_clear()
@@ -551,9 +554,7 @@ class ManipulationNode(Node):
                 rclpy.spin_once(self, timeout_sec=0.05)
             self.cmd_vel.publish(Twist())
             self.wait(0.5)
-            _x, _y, yaw = self.base_pose()
-            if abs(math.degrees(wrap(yaw0 - yaw))) > STRAFE_YAW_TOLERANCE_DEG:
-                self.rotate_to(yaw0, tol_deg=1.5)
+            self.hold_heading(yaw0)
 
         # Each heading correction nudges the base back ~14 mm; drive it out again.
         x, y, _yaw = self.base_pose()
@@ -563,6 +564,23 @@ class ManipulationNode(Node):
         achieved = lateral()
         self.log(f'Strafed {achieved:+.3f} m of {dy:+.3f} m.')
         return achieved
+
+    def hold_heading(self, yaw0):
+        """Turn back to square after a lateral burst, measured on the shelf when possible.
+
+        The wheels can slide the base round without odometry seeing it: holding
+        the odometry heading once left the base 81 deg off the shelf. So the
+        shelf face seen by the front LiDAR is the reference, and odometry is
+        used only when the shelf cannot be measured.
+        """
+        err = self.shelf_yaw_error()
+        if err is not None:
+            if abs(err) > STRAFE_YAW_TOLERANCE_DEG:
+                self.rotate_by(math.radians(err))
+            return
+        _x, _y, yaw = self.base_pose()
+        if abs(math.degrees(wrap(yaw0 - yaw))) > STRAFE_YAW_TOLERANCE_DEG:
+            self.rotate_to(yaw0, tol_deg=1.5)
 
     def sidestep(self, dy):
         """Move sideways by dy (left +) as turn, drive, turn back, closed on odometry."""
@@ -726,6 +744,10 @@ class ManipulationNode(Node):
         """Rotate the base until it faces the shelf square."""
         for _ in range(passes):
             err = self.shelf_yaw_error()
+            if err is None:
+                # An arm still moving past the laser blocks it; look again.
+                self.wait(3.0)
+                err = self.shelf_yaw_error()
             if err is None:
                 self.get_logger().warn('Could not measure the shelf; not squaring up.')
                 return
@@ -905,6 +927,13 @@ class ManipulationNode(Node):
                 return False
             _box, point = found
             bx, by, bz = point.point.x, point.point.y, point.point.z
+
+        # Sliding can turn the base; square up again and re-measure before reaching.
+        self.square_up()
+        self.fresh_image()
+        again = self.find_row(row)
+        if again is not None:
+            bx, by, bz = again[1].point.x, again[1].point.y, again[1].point.z
 
         # Put the book where the whole pre-grasp -> grasp stroke is reachable,
         # and measure again while the torso is still low enough to see it.
