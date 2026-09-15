@@ -9,7 +9,7 @@ Node 3 of the pipeline. It waits for node 2 to report REACHED_SHELF on
            and reach, close, lift and retract;
   deliver  back off the shelf, tuck the book in against the body, return to
            the start zone on odometry, line up on the red collection bin by
-           vision, lower the book over its rim and let go.
+           vision, and drop the book in from just above its rim.
 
 Every number below was measured in the ERC simulation against Gazebo ground
 truth, and the comments say what went wrong without it. Three findings shape
@@ -146,12 +146,15 @@ TORSO_FOR_DELIVERY = 0.32
 CARRY = (0.30, 0.15, 0.95)
 # Line-up on the bin: base centre this far short of its near rim.
 TARGET_NEAR_X = 0.545
-ALIGN_YAW_TOL_DEG = 3.0
+# Loose on purpose: the arm reaches for the bin where the camera measured it,
+# so the base only has to put the bin within reach. Lining up to 3 cm took
+# about 9 minutes of a 40-minute run for no gain in where the book lands.
+ALIGN_YAW_TOL_DEG = 6.0
 ALIGN_YAW_GAIN = 0.8
 ALIGN_AXIS_MAX_DEG = 60.0
 ALIGN_BEARING_MAX_DEG = 20.0
-ALIGN_LATERAL_TOL = 0.03
-ALIGN_RANGE_TOL = 0.03
+ALIGN_LATERAL_TOL = 0.12        # bin inner half-width is 0.155 m
+ALIGN_RANGE_TOL = 0.10          # near rim 0.445-0.645 m ahead keeps the drop point in reach
 ALIGN_PASSES = 6
 # Steep tilts first: at -0.35 the near rim can fall out of the frame, and the
 # near edge then measured 0.11 m too far (probe_bin.py against ground truth).
@@ -165,8 +168,10 @@ TABLE_TOP_Z = 0.74 - BASE_LINK_HEIGHT
 BOOK_BELOW_GRASP = 0.14
 BOOK_AHEAD_OF_GRASP = 0.14
 GRIPPER_BEHIND_GRASP = 0.157
+# The book is dropped from here: grasp point 0.19 m above the rim puts the
+# bottom of the hanging book ~5 cm above it, so the swing over the bin cannot
+# clip the rim (lowering past it nudged the bin 8 cm) and the book falls in.
 ABOVE_RIM_CLEARANCE = 0.19
-RELEASE_RIM_CLEARANCE = 0.04
 
 
 def wrap(angle):
@@ -1009,15 +1014,13 @@ class ManipulationNode(Node):
         rel_x = min(near + GRIPPER_BEHIND_GRASP + 0.04,
                     near + BIN_LENGTH - 0.04 - BOOK_AHEAD_OF_GRASP)
         above_z = rim_z + ABOVE_RIM_CLEARANCE
-        release_z = rim_z + RELEASE_RIM_CLEARANCE
         self.reach(rel_x, bin_y, above_z)
-        self.reach(rel_x, bin_y, 0.5 * (above_z + release_z), seconds=4, settle=8)
-        self.reach(rel_x, bin_y, release_z, seconds=4, settle=8)
         self.release()
-        self.log('[NODE 3 DELIVER] Released over the bin.')
-        # Lift clear and tuck in before anything else moves: moving the base
-        # with the arm over the bin once dragged the bin 0.34 m.
-        self.reach(rel_x, bin_y, above_z)
+        self.log('[NODE 3 DELIVER] Dropped the book into the bin.')
+        # The trial timer stops when the book touches the bin, so report now and
+        # tuck the arm afterwards (moving the base with the arm over the bin once
+        # dragged the bin 0.34 m, so the arm always comes back in).
+        self.publish_status('DELIVERED')
         self.reach(*CARRY)
         return True
 
@@ -1039,7 +1042,6 @@ class ManipulationNode(Node):
             self.log('=' * 50)
             self.log('[NODE 3 SUCCESS] Book delivered to the collection bin.')
             self.log('=' * 50)
-            self.publish_status('DELIVERED')
         else:
             self.publish_status('DELIVERY_FAILED')
 
