@@ -901,8 +901,14 @@ class ManipulationNode(Node):
         """Find the book on `row`, line the base up with it and pick it up."""
         self.log(f'[NODE 3 GRASP] Picking up the {self.book_colour} book on row {row}.')
         self.gripper(GRIPPER_OPEN)
-        self.ramp_torso(TORSO_FOR_ROW[row])
+        # Clear the arms with the torso up: swinging to the clear pose with the
+        # torso low drags the right arm against the base, and it arrived minutes
+        # late (torso 0.18) or stalled half-way (0.05). Lowering it afterwards,
+        # with the arms already clear, is fine.
+        if self.pos('torso_lift_joint') < TORSO_FOR_GRASP - 0.02:
+            self.ramp_torso(TORSO_FOR_GRASP)
         self.clear_arms()
+        self.ramp_torso(TORSO_FOR_ROW[row])
         # Square to the shelf before looking: parked 23 deg off, the approach
         # swept the book over.
         self.square_up()
